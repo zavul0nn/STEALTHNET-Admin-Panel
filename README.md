@@ -147,110 +147,8 @@ Telegram бот для клиентов с полным функционалом
 - **HTML5/CSS3/JavaScript** — нативный веб
 - **QRCode.js** — генерация QR-кодов
 - **Современный дизайн** — glassmorphism эффекты
-## 🐳 Установка через Docker (Рекомендуется)
 
-Docker установка — самый простой и быстрый способ развернуть StealthNET. Все компоненты (API, фронтенд, веб-сервер) запускаются автоматически.
-
-### Быстрый старт
-
-```bash
-# 1. Клонируйте репозиторий в любую директорию (например, /opt/)
-git clone https://github.com/GOFONCK/STEALTHNET-Admin-Panel.git /opt/stealthnet
-cd /opt/stealthnet
-
-# Или если уже склонировали в другую директорию
-cd /path/to/your/project
-
-# 2. Создайте файл .env
-cp env.example .env
-
-# 3. Отредактируйте .env и заполните обязательные переменные
-nano .env  # или используйте любой текстовый редактор
-```
-
-**Примечание:** Все пути в Docker Compose относительные, поэтому проект работает из любой директории (`/opt/`, `/home/user/`, `/var/www/` и т.д.).
-
-**Обязательные переменные в .env:**
-- `ADMIN_TOKEN` - токен для доступа к RemnaWave API
-- `API_URL` - URL RemnaWave API
-- `DEFAULT_SQUAD_ID` - ID дефолтного сквада
-- `YOUR_SERVER_IP` - ваш домен (например, `https://panel.stealthnet.app`)
-- `JWT_SECRET_KEY` - секретный ключ для JWT токенов (сгенерируйте случайную строку)
-- `FERNET_KEY` - ключ для шифрования (сгенерируйте: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
-
-### Запуск с Nginx
-
-```bash
-# Запуск всех сервисов
-docker-compose up -d
-
-# Просмотр логов
-docker-compose logs -f
-
-# Проверка статуса
-docker-compose ps
-```
-
-### Запуск с Caddy (автоматический SSL)
-
-```bash
-# Запуск с Caddy (автоматически получает SSL сертификаты)
-docker-compose --profile caddy up -d api caddy
-
-# Просмотр логов
-docker-compose logs -f caddy
-```
-
-### Создание администратора
-
-```bash
-# Войдите в контейнер API
-docker-compose exec api bash
-
-# Создайте администратора
-python -m flask --app app make-admin your-email@example.com
-
-# Выйдите
-exit
-```
-
-### Настройка домена
-
-**С Nginx:**
-1. Отредактируйте `nginx.conf`
-2. Замените `server_name _;` на ваш домен
-3. Настройте SSL (см. [DOCKER_SETUP.md](./DOCKER_SETUP.md))
-
-**С Caddy:**
-1. Отредактируйте `Caddyfile`
-2. Раскомментируйте блок с доменом
-3. Замените `your-domain.com` на ваш домен
-4. Caddy автоматически получит SSL сертификат через Let's Encrypt
-
-### Полезные команды Docker
-
-```bash
-# Остановка
-docker-compose down
-
-# Перезапуск
-docker-compose restart
-
-# Обновление (после изменений в коде)
-docker-compose build --no-cache
-docker-compose up -d
-
-# Просмотр логов конкретного сервиса
-docker-compose logs -f api
-docker-compose logs -f nginx
-```
-
-📚 **Подробная документация:** [DOCKER_SETUP.md](./DOCKER_SETUP.md) | [QUICKSTART.md](./QUICKSTART.md)
-
----
-
-
-## 📦 Ручная Установка
+## 📦 Ручная Установка (Автоматическая временно убрана)
 
 ### Требования
 - Python 3.8+
@@ -261,8 +159,9 @@ docker-compose logs -f nginx
 ### 1. Клонирование репозитория
 
 ```bash
+cd /opt
 git clone https://github.com/GOFONCK/STEALTHNET-Admin-Panel.git
-cd stealthnet-vpn
+cd STEALTHNET-Admin-Panel
 ```
 
 ### 2. Настройка Backend (Flask API)
@@ -278,36 +177,13 @@ venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 
 # Создайте файл .env
-cp .env.example .env
-# Отредактируйте .env и укажите необходимые переменные
-
-# Инициализируйте базу данных
-python scripts/init_db.py
-
-# Создайте администратора
-python -m flask --app app make-admin your@email.com
-```
-
-### 3. Настройка Admin Panel (Не требуется, в проекте лежит готовый build в папке frontend просто проксируйте ее)
-
-```bash
-cd admin-panel
-
-# Установите зависимости
-npm install
-
-# Создайте production build
-npm run build
-```
-
-
-## ⚙️ Настройка
+nano .env
 
 ### Переменные окружения (.env)
 
 ```env
 # Flask API
-ADMIN_TOKEN=
+ADMIN_TOKEN= 
 JWT_SECRET_KEY=your_secret_key_here
 API_URL=https://your-vpn-api.com
 DEFAULT_SQUAD_ID=your_default_squad_id
@@ -325,9 +201,10 @@ MAIL_SERVER=smtp.gmail.com
 MAIL_PORT=587
 MAIL_USE_TLS=True
 MAIL_USERNAME=your_email@gmail.com
-MAIL_PASSWORD=your_password
+MAIL_PASSWORD=your_password - код пароль приложения
 
-
+Для получения пароля  gmail вот инструкция https://www.getmailbird.com/ru/parol-prilozheniya-gmail/
+Лио меняйте настройки smtp на свой почтовик и используйте его !
 
 ### Генерация Fernet ключа
 
@@ -335,28 +212,33 @@ MAIL_PASSWORD=your_password
 python scripts/generate_fernet_key.py
 ```
 
-### Запуск в продакшене
 
-#### Flask API (Gunicorn)
 
-```bash
-# Используйте systemd сервис
-sudo cp config/flask_api.service /etc/systemd/system/
-sudo systemctl enable flask_api
-sudo systemctl start flask_api
+#### 
+
+
+# Отредактируйте .env и укажите необходимые переменные
+
+# Запуск  Backend 
+
+gunicorn --workers 3 --bind 127.0.0.1:5000 app:app --daemon
+
+
+# Создайте администратора
+python -m flask --app app make-admin your@email.com
 ```
 
-Подробнее: [docs/GUNICORN_SETUP.md](docs/GUNICORN_SETUP.md)
+## 3. Настройка Admin Panel (Не требуется, в проекте лежит готовый build в папке frontend просто проксируйте ее)
+Для нормальной работы , нужно класть сайт в папку /opt/frontend/build
 
-#### Telegram Bot (Systemd)
+просто перенесите папку frontend в  opt ( Используйте этот ssh клиент для удобства 🧪 [Клиент SSH MobaxTerm](https://mobaxterm.mobatek.net/download.html))
 
-```bash
-sudo cp config/client_bot.service /etc/systemd/system/
-sudo systemctl enable client_bot
-sudo systemctl start client_bot
-```
+После установить  nginx и проксировать сайт!
 
-## 📁 Структура проекта
+## ⚙️ Настройка
+
+
+#№ 📁 Структура проекта
 
 ```
 stealthnet-vpn/
@@ -382,30 +264,17 @@ stealthnet-vpn/
 
 При обновлении системы может потребоваться выполнить миграции БД:
 
-```bash
-# Через Flask CLI (если доступно)
-flask migrate-yookassa-fields
-
 # Или через скрипт
-python migrations/migrate_add_yookassa_fields.py
+python migrate_add_yookassa_fields.py
 ```
 
-Подробнее: [docs/MIGRATION_INSTRUCTIONS.md](docs/MIGRATION_INSTRUCTIONS.md)
 
-## 🚀 Быстрый старт
 
-1. **Клонируйте репозиторий**
-2. **Настройте `.env` файл**
-3. **Инициализируйте БД:** `python scripts/init_db.py`
-4. **Создайте администратора:** `python -m flask --app app make-admin your@email.com`
-5. **Запустите Flask API:** `gunicorn -c config/gunicorn_config.py app:app`
-6. **Запустите Telegram бота:** `python client_bot.py`
-7. **Соберите Admin Panel:** `cd admin-panel && npm run build`
 
 ## 🐛 Решение проблем
 
 ### Ошибки базы данных
-Если возникают ошибки типа `no such column`, выполните соответствующие миграции из папки `migrations/`.
+Если возникают ошибки типа `no such column`, выполните соответствующие миграции.
 
 ### Проблемы с Telegram ботом
 - Проверьте `CLIENT_BOT_TOKEN` в `.env`
@@ -433,6 +302,7 @@ python migrations/migrate_add_yookassa_fields.py
 ---
 
 **StealthNET VPN** — Ваша свобода в цифровом мире 🛡️
+
 
 
 
