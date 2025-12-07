@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Скрипт миграции для добавления новых платежных систем в существующую базу данных.
-Добавляет колонки для Platega, Mulenpay и UrlPay в таблицу payment_setting.
+Добавляет колонки для Platega, Mulenpay, UrlPay и Monobank в таблицу payment_setting.
 
 Использование:
     python3 migrate_payment_systems.py
@@ -75,6 +75,7 @@ try:
         'urlpay_api_key': 'TEXT',
         'urlpay_secret_key': 'TEXT',
         'urlpay_shop_id': 'TEXT',
+        'monobank_token': 'TEXT',
     }
     
     # Добавляем каждую колонку, если её нет

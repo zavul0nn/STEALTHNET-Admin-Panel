@@ -1,5 +1,6 @@
 import os
-from flask import Flask, request, jsonify, render_template, current_app
+import json
+from flask import Flask, request, jsonify, render_template, current_app, send_from_directory, send_file, redirect
 from flask_cors import CORS 
 import requests
 from datetime import datetime, timedelta, timezone 
@@ -32,10 +33,30 @@ BOT_API_URL = os.getenv("BOT_API_URL", "")  # URL веб-API бота (напр�
 BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")  # Токен для доступа к API бота
 TELEGRAM_BOT_NAME = os.getenv("TELEGRAM_BOT_NAME", "")  # Имя бота для Telegram Login Widget
 
+# Cookies для Remnawave API (если панель требует cookies вместо/в дополнение к Bearer токену)
+# Формат: COOKIES={"cookie_name":"cookie_value"} или COOKIES={"aEmFnBcC":"WbYWpixX"}
+REMNAWAVE_COOKIES_STR = os.getenv("REMNAWAVE_COOKIES", "")
+REMNAWAVE_COOKIES = {}
+if REMNAWAVE_COOKIES_STR:
+    try:
+        REMNAWAVE_COOKIES = json.loads(REMNAWAVE_COOKIES_STR)
+    except json.JSONDecodeError:
+        print(f"⚠️ Warning: REMNAWAVE_COOKIES is not valid JSON, ignoring: {REMNAWAVE_COOKIES_STR}")
+
 app = Flask(__name__)
 
 # CORS
-CORS(app, resources={r"/api/.*": {"origins": ["http://localhost:3000", YOUR_SERVER_IP_OR_DOMAIN]}})
+CORS(app, resources={r"/api/.*": {
+    "origins": [
+        "http://localhost:3000", 
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        YOUR_SERVER_IP_OR_DOMAIN,
+        "https://stealthnet.app",
+        "http://stealthnet.app"
+    ]
+}})
 
 # База данных и Секреты
 app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
@@ -54,7 +75,11 @@ app.config['MAIL_USE_TLS'] = False
 app.config['MAIL_USE_SSL'] = True
 app.config['MAIL_USERNAME'] = os.getenv("MAIL_USERNAME")
 app.config['MAIL_PASSWORD'] = os.getenv("MAIL_PASSWORD")
-app.config['MAIL_DEFAULT_SENDER'] = ('StealthNET', app.config['MAIL_USERNAME'])
+# Устанавливаем отправителя только если MAIL_USERNAME настроен
+if app.config['MAIL_USERNAME']:
+    app.config['MAIL_DEFAULT_SENDER'] = ('StealthNET', app.config['MAIL_USERNAME'])
+else:
+    app.config['MAIL_DEFAULT_SENDER'] = ('StealthNET', 'noreply@stealthnet.app')
 
 # Лимитер (Защита от спама запросами)
 limiter = Limiter(
@@ -156,11 +181,13 @@ class PaymentSetting(db.Model):
     urlpay_api_key = db.Column(db.Text, nullable=True)  # API ключ UrlPay
     urlpay_secret_key = db.Column(db.Text, nullable=True)  # Secret ключ UrlPay
     urlpay_shop_id = db.Column(db.Text, nullable=True)  # Shop ID UrlPay
+    monobank_token = db.Column(db.Text, nullable=True)  # Токен Monobank
 
 class SystemSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     default_language = db.Column(db.String(10), default='ru', nullable=False)
     default_currency = db.Column(db.String(10), default='uah', nullable=False)
+    show_language_currency_switcher = db.Column(db.Boolean, default=True, nullable=False)  # Показывать ли переключатели языка и валюты в Dashboard
 
 class BrandingSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -256,6 +283,35 @@ def decrypt_key(key):
     try: return fernet.decrypt(key).decode('utf-8')
     except Exception: return ""
 
+def get_remnawave_headers(additional_headers=None):
+    """
+    Формирует заголовки для запросов к Remnawave API.
+    Поддерживает как Bearer токен, так и cookies (если настроены).
+    Возвращает кортеж (headers, cookies) для использования в requests.
+    
+    Args:
+        additional_headers: Словарь с дополнительными заголовками, которые будут объединены с основными
+    
+    Returns:
+        tuple: (headers_dict, cookies_dict) для использования в requests.get/post/patch/delete
+    """
+    headers = {}
+    cookies = {}
+    
+    # Добавляем Bearer токен, если он настроен
+    if ADMIN_TOKEN:
+        headers["Authorization"] = f"Bearer {ADMIN_TOKEN}"
+    
+    # Добавляем дополнительные заголовки, если они переданы
+    if additional_headers:
+        headers.update(additional_headers)
+    
+    # Добавляем cookies, если они настроены
+    if REMNAWAVE_COOKIES:
+        cookies.update(REMNAWAVE_COOKIES)
+    
+    return headers, cookies
+
 def sync_subscription_to_bot_in_background(app_context, remnawave_uuid):
     """Синхронизирует подписку пользователя из RemnaWave в бота в фоновом режиме"""
     with app_context:
@@ -293,8 +349,8 @@ def sync_subscription_to_bot_in_background(app_context, remnawave_uuid):
 def apply_referrer_bonus_in_background(app_context, referrer_uuid, bonus_days):
     with app_context: 
         try:
-            admin_headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
-            resp = requests.get(f"{API_URL}/api/users/{referrer_uuid}", headers=admin_headers)
+            admin_headers, admin_cookies = get_remnawave_headers()
+            resp = requests.get(f"{API_URL}/api/users/{referrer_uuid}", headers=admin_headers, cookies=admin_cookies)
             if resp.ok:
                 live_data = resp.json().get('response', {})
                 curr = parse_iso_datetime(live_data.get('expireAt'))
@@ -308,12 +364,43 @@ def apply_referrer_bonus_in_background(app_context, referrer_uuid, bonus_days):
 def send_email_in_background(app_context, recipient, subject, html_body):
     with app_context:
         try:
+            from flask import current_app
+            # Проверяем настройки email перед отправкой
+            if not current_app.config.get('MAIL_SERVER'):
+                print(f"[EMAIL] ОШИБКА: MAIL_SERVER не настроен в .env")
+                return
+            if not current_app.config.get('MAIL_USERNAME'):
+                print(f"[EMAIL] ОШИБКА: MAIL_USERNAME не настроен в .env")
+                return
+            if not current_app.config.get('MAIL_PASSWORD'):
+                print(f"[EMAIL] ОШИБКА: MAIL_PASSWORD не настроен в .env")
+                return
+            
+            print(f"[EMAIL] Отправка письма на {recipient} с темой: {subject}")
             msg = Message(subject, recipients=[recipient])
             msg.html = html_body
             mail.send(msg)
+            print(f"[EMAIL] ✓ Письмо успешно отправлено на {recipient}")
         except Exception as e:
-            print(f"[EMAIL] ОШИБКА: {e}")
+            print(f"[EMAIL] ОШИБКА отправки на {recipient}: {e}")
+            import traceback
+            traceback.print_exc()
 
+
+# ----------------------------------------------------
+# MIDDLEWARE - ЛОГИРОВАНИЕ ВСЕХ ЗАПРОСОВ
+# ----------------------------------------------------
+@app.before_request
+def log_request_info():
+    """Логирование всех входящих запросов для отладки"""
+    if request.path.startswith('/api/public/forgot-password'):
+        print(f"[MIDDLEWARE] ========== ЗАПРОС ДОШЕЛ ДО FLASK ==========")
+        print(f"[MIDDLEWARE] Method: {request.method}")
+        print(f"[MIDDLEWARE] Path: {request.path}")
+        print(f"[MIDDLEWARE] Remote Address: {request.remote_addr}")
+        print(f"[MIDDLEWARE] Headers: {dict(request.headers)}")
+        print(f"[MIDDLEWARE] Data: {request.data}")
+        print(f"[MIDDLEWARE] JSON: {request.json}")
 
 # ----------------------------------------------------
 # ЭНДПОИНТЫ
@@ -331,6 +418,9 @@ def public_register():
     if not email or not password: 
         return jsonify({"message": "Требуется адрес электронной почты и пароль"}), 400
         
+    # Нормализуем email (приводим к нижнему регистру)
+    email = email.strip().lower()
+    
     # Проверяем существование пользователя по email (email обязателен для обычной регистрации)
     if User.query.filter_by(email=email).first(): return jsonify({"message": "User exists"}), 400
 
@@ -353,7 +443,8 @@ def public_register():
     }
     
     try:
-        resp = requests.post(f"{API_URL}/api/users", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}, json=payload_create)
+        headers, cookies = get_remnawave_headers()
+        resp = requests.post(f"{API_URL}/api/users", headers=headers, cookies=cookies, json=payload_create)
         resp.raise_for_status()
         remnawave_uuid = resp.json().get('response', {}).get('uuid')
         
@@ -395,6 +486,141 @@ def public_register():
     except Exception as e:
         print(f"Register Error: {e}")
         return jsonify({"message": "Internal Server Error"}), 500
+
+@app.route('/api/public/forgot-password', methods=['POST', 'OPTIONS'])
+@limiter.limit("5 per hour")  # Ограничение: 5 запросов в час
+def forgot_password():
+    """Восстановление пароля - отправка нового пароля на email"""
+    print(f"[FORGOT PASSWORD] ========== ЗАПРОС ПОЛУЧЕН ==========")
+    print(f"[FORGOT PASSWORD] Method: {request.method}")
+    print(f"[FORGOT PASSWORD] Remote Address: {request.remote_addr}")
+    print(f"[FORGOT PASSWORD] Headers: {dict(request.headers)}")
+    
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        print(f"[FORGOT PASSWORD] OPTIONS запрос, возвращаем CORS headers")
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+    
+    print(f"[FORGOT PASSWORD] POST запрос, продолжаем обработку")
+    print(f"[FORGOT PASSWORD] Data: {request.data}")
+    print(f"[FORGOT PASSWORD] Content-Type: {request.content_type}")
+    try:
+        data = request.json or {}
+        print(f"[FORGOT PASSWORD] Данные запроса (JSON): {data}")
+        email = data.get('email', '').strip().lower()
+        print(f"[FORGOT PASSWORD] Email из запроса: {email}")
+        
+        if not email:
+            print(f"[FORGOT PASSWORD] Email пустой, возвращаем 400")
+            return jsonify({"message": "Email is required"}), 400
+        
+        # Ищем пользователя по email (case-insensitive поиск)
+        # Пробуем сначала точное совпадение, потом case-insensitive
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            # Если не нашли, пробуем case-insensitive поиск
+            from sqlalchemy import func
+            user = User.query.filter(func.lower(User.email) == email).first()
+        print(f"[FORGOT PASSWORD] Пользователь найден: {user is not None}")
+        if user:
+            print(f"[FORGOT PASSWORD] Email пользователя в БД: {user.email}")
+        
+        # Всегда возвращаем успех для безопасности (чтобы не раскрывать, существует ли email)
+        if not user:
+            print(f"[FORGOT PASSWORD] Пользователь не найден, возвращаем успех (безопасность)")
+            return jsonify({"message": "If this email exists, a password reset link has been sent"}), 200
+        
+        # Пытаемся получить существующий пароль из encrypted_password
+        password_to_send = None
+        password_source = None
+        
+        if fernet and user.encrypted_password:
+            try:
+                # Расшифровываем существующий пароль
+                password_to_send = fernet.decrypt(user.encrypted_password.encode()).decode('utf-8')
+                password_source = "existing"
+                print(f"[FORGOT PASSWORD] Найден зашифрованный пароль, расшифрован: {password_to_send[:3]}***")
+            except Exception as e:
+                print(f"[FORGOT PASSWORD] Ошибка расшифровки encrypted_password: {e}")
+                password_to_send = None
+        
+        # Если не удалось получить существующий пароль, генерируем новый
+        if not password_to_send:
+            import secrets
+            import string
+            password_to_send = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+            password_source = "new"
+            print(f"[FORGOT PASSWORD] Новый пароль сгенерирован: {password_to_send[:3]}***")
+            
+            # Хешируем и сохраняем новый пароль
+            hashed_password = bcrypt.generate_password_hash(password_to_send).decode('utf-8')
+            user.password_hash = hashed_password
+            
+            # Сохраняем зашифрованный пароль для будущего использования
+            if fernet:
+                try:
+                    user.encrypted_password = fernet.encrypt(password_to_send.encode()).decode()
+                    print(f"[FORGOT PASSWORD] Новый пароль зашифрован и сохранен")
+                except Exception as e:
+                    print(f"[FORGOT PASSWORD] Ошибка шифрования нового пароля: {e}")
+            
+            db.session.commit()
+            print(f"[FORGOT PASSWORD] Новый пароль сохранен в БД")
+        
+        # Отправляем пароль на email
+        user_email = user.email  # Сохраняем email пользователя в отдельную переменную
+        print(f"[FORGOT PASSWORD] Email пользователя для отправки: {user_email}")
+        password_label = "Ваш пароль" if password_source == "existing" else "Ваш новый пароль"
+        subject = "Восстановление пароля StealthNET"
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #4a90e2;">Восстановление пароля</h2>
+                <p>Здравствуйте!</p>
+                <p>Вы запросили восстановление пароля для вашего аккаунта StealthNET.</p>
+                <p><strong>{password_label}:</strong></p>
+                <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0; font-family: monospace; font-size: 18px; text-align: center; letter-spacing: 2px;">
+                    {password_to_send}
+                </div>
+                <p style="color: #666; font-size: 14px;">{"Используйте этот пароль для входа в систему." if password_source == "existing" else "Рекомендуем изменить этот пароль после входа в систему."}</p>
+                <p style="color: #666; font-size: 14px;">Если вы не запрашивали восстановление пароля, проигнорируйте это письмо.</p>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+                <p style="color: #999; font-size: 12px;">© 2025 StealthNET. Privacy First.</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Проверяем настройки email перед отправкой
+        if not app.config.get('MAIL_SERVER') or not app.config.get('MAIL_USERNAME') or not app.config.get('MAIL_PASSWORD'):
+            print(f"[FORGOT PASSWORD] Предупреждение: Настройки email не полностью настроены")
+            print(f"   MAIL_SERVER: {'✓' if app.config.get('MAIL_SERVER') else '✗'}")
+            print(f"   MAIL_USERNAME: {'✓' if app.config.get('MAIL_USERNAME') else '✗'}")
+            print(f"   MAIL_PASSWORD: {'✓' if app.config.get('MAIL_PASSWORD') else '✗'}")
+        
+        # Отправляем email в фоновом режиме (используем тот же подход, что и при регистрации)
+        print(f"[FORGOT PASSWORD] Подготовка отправки email на {user_email}")
+        threading.Thread(
+            target=send_email_in_background,
+            args=(app.app_context(), user_email, subject, html_body),
+            daemon=True
+        ).start()
+        
+        print(f"[FORGOT PASSWORD] Запрос на восстановление пароля для {user_email}, пароль {'найден' if password_source == 'existing' else 'сгенерирован'}: {password_to_send[:3]}***")
+        
+        return jsonify({"message": "If this email exists, a password reset link has been sent"}), 200
+        
+    except Exception as e:
+        print(f"[FORGOT PASSWORD] ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+        # Все равно возвращаем успех для безопасности
+        return jsonify({"message": "If this email exists, a password reset link has been sent"}), 200
 
 @app.route('/api/public/login', methods=['POST'])
 @limiter.limit("10 per minute")
@@ -1169,7 +1395,18 @@ def get_client_me():
     force_refresh = request.args.get('force_refresh', 'false').lower() == 'true'
     
     if not force_refresh:
-        if cached := cache.get(cache_key): 
+        if cached := cache.get(cache_key):
+            # ВСЕГДА обновляем preferred_lang и preferred_currency из БД, даже если данные из кэша
+            # Это нужно, чтобы изменения настроек сразу отображались
+            if isinstance(cached, dict):
+                cached = cached.copy()  # Создаем копию, чтобы не изменять оригинал в кэше
+                cached.update({
+                    'referral_code': user.referral_code, 
+                    'preferred_lang': user.preferred_lang, 
+                    'preferred_currency': user.preferred_currency,
+                    'telegram_id': user.telegram_id,
+                    'telegram_username': user.telegram_username
+                })
             return jsonify({"response": cached}), 200
     
     try:
@@ -1242,13 +1479,2275 @@ def activate_trial():
         if referral_settings and referral_settings.trial_squad_id:
             trial_squad_id = referral_settings.trial_squad_id
         
-        requests.patch(f"{API_URL}/api/users", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}, 
+        headers, cookies = get_remnawave_headers()
+        requests.patch(f"{API_URL}/api/users", headers=headers, cookies=cookies, 
                        json={"uuid": user.remnawave_uuid, "expireAt": new_exp, "activeInternalSquads": [trial_squad_id]})
         cache.delete(f'live_data_{user.remnawave_uuid}')
         cache.delete('all_live_users_map')
         cache.delete(f'nodes_{user.remnawave_uuid}')  # Очищаем кэш серверов при изменении сквада
         return jsonify({"message": "Trial activated"}), 200
     except Exception as e: return jsonify({"message": "Internal Error"}), 500
+
+@app.route('/miniapp/subscription', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_subscription():
+    """
+    Эндпоинт для получения данных подписки в Telegram Mini App.
+    Принимает initData от Telegram Web App и возвращает данные пользователя.
+    """
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    print(f"[MINIAPP] POST /miniapp/subscription received")
+    print(f"[MINIAPP] Content-Type: {request.content_type}")
+    print(f"[MINIAPP] Method: {request.method}")
+    
+    try:
+        # Пробуем получить данные из разных источников
+        data = {}
+        
+        # 1. Пробуем JSON
+        try:
+            if request.is_json:
+                data = request.json or {}
+                print(f"[MINIAPP] Data from JSON: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+        except Exception as e:
+            print(f"[MINIAPP] Error parsing JSON: {e}")
+        
+        # 2. Пробуем form-data
+        if not data and request.form:
+            data = dict(request.form)
+            print(f"[MINIAPP] Data from form: {list(data.keys())}")
+        
+        # 3. Пробуем raw data
+        if not data and request.data:
+            try:
+                import json as json_lib
+                raw_data = request.data.decode('utf-8')
+                print(f"[MINIAPP] Raw data preview: {raw_data[:200]}")
+                # Пробуем распарсить как JSON
+                if raw_data.strip().startswith('{') or raw_data.strip().startswith('['):
+                    data = json_lib.loads(raw_data)
+                    print(f"[MINIAPP] Data from raw JSON: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+                else:
+                    # Если не JSON, пробуем как URL-encoded
+                    import urllib.parse
+                    data = urllib.parse.parse_qs(raw_data)
+                    # Преобразуем списки в строки
+                    data = {k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in data.items()}
+                    print(f"[MINIAPP] Data from URL-encoded: {list(data.keys())}")
+            except Exception as e:
+                print(f"[MINIAPP] Error parsing raw data: {e}")
+        
+        # Логируем входящие данные для отладки
+        print(f"[MINIAPP] Final data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+        
+        # Пробуем получить initData из разных возможных полей
+        init_data = data.get('initData') or data.get('init_data') or data.get('data') or ''
+        
+        if not init_data:
+            # Если initData отсутствует, логируем подробную информацию
+            print(f"[MINIAPP] No initData found. Request details:")
+            print(f"  - Content-Type: {request.content_type}")
+            print(f"  - Has JSON: {request.is_json}")
+            print(f"  - Has form: {bool(request.form)}")
+            print(f"  - Has data: {bool(request.data)}")
+            print(f"  - Data length: {len(request.data) if request.data else 0}")
+            if request.data:
+                try:
+                    print(f"  - Data preview: {request.data.decode('utf-8')[:500]}")
+                except:
+                    print(f"  - Data (bytes): {request.data[:100]}")
+            
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Missing initData. Please open the mini app from Telegram.",
+                    "hint": "The mini app must be opened from Telegram to work properly."
+                }
+            }), 401
+        
+        # Парсим initData от Telegram Web App
+        # Формат: user=%7B%22id%22%3A123456789%2C...%7D&auth_date=1234567890&hash=...
+        import urllib.parse
+        import json as json_lib
+        
+        parsed_data = urllib.parse.parse_qs(init_data)
+        user_str = parsed_data.get('user', [''])[0]
+        
+        if not user_str:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Invalid initData format. Please open the mini app from Telegram."
+                }
+            }), 401
+        
+        # Декодируем JSON из user параметра
+        try:
+            user_data = json_lib.loads(urllib.parse.unquote(user_str))
+            telegram_id = user_data.get('id')
+        except (json_lib.JSONDecodeError, KeyError):
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Invalid user data in initData."
+                }
+            }), 401
+        
+        if not telegram_id:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Telegram ID not found in initData."
+                }
+            }), 401
+        
+        # Находим пользователя по telegram_id
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered. Please register in the bot first.",
+                    "code": "user_not_found"
+                }
+            }), 404
+        
+        # Вспомогательная функция для адаптации данных под miniapp
+        def adapt_data_for_miniapp(data_dict, user_obj):
+            """Адаптирует данные под формат, ожидаемый miniapp"""
+            if not isinstance(data_dict, dict):
+                return data_dict
+            
+            # Проверяем, есть ли активная подписка
+            expire_at = data_dict.get('expireAt') or data_dict.get('expire_at')
+            has_active_subscription = False
+            if expire_at:
+                try:
+                    expire_dt = parse_iso_datetime(expire_at) if isinstance(expire_at, str) else expire_at
+                    now = datetime.now(timezone.utc)
+                    has_active_subscription = expire_dt > now if expire_dt else False
+                except:
+                    has_active_subscription = False
+            
+            # Формируем объект user, как ожидает miniapp
+            username = user_obj.telegram_username or f"user_{user_obj.telegram_id}"
+            display_name = user_obj.telegram_username or f"User {user_obj.telegram_id}"
+            
+            user_data = {
+                'id': user_obj.telegram_id,
+                'telegram_id': user_obj.telegram_id,
+                'username': username,
+                'display_name': display_name,
+                'first_name': None,  # Можно добавить из initData, если нужно
+                'last_name': None,   # Можно добавить из initData, если нужно
+                'email': user_obj.email or f"tg_{user_obj.telegram_id}@telegram.local",
+                'uuid': data_dict.get('uuid') or user_obj.remnawave_uuid,
+                'has_active_subscription': has_active_subscription,
+                'subscription_actual_status': 'active' if has_active_subscription else 'inactive',
+                'subscription_status': 'active' if has_active_subscription else 'inactive',
+                'subscription_type': None,  # Можно добавить, если есть в данных
+                'expireAt': expire_at,
+                'expires_at': expire_at,  # Для совместимости с miniapp
+                'referral_code': user_obj.referral_code,
+                'preferred_lang': user_obj.preferred_lang,
+                'preferred_currency': user_obj.preferred_currency
+            }
+            
+            # Добавляем данные о трафике
+            used_traffic_bytes = data_dict.get('usedTrafficBytes') or data_dict.get('used_traffic_bytes') or data_dict.get('lifetimeUsedTrafficBytes') or 0
+            traffic_limit_bytes = data_dict.get('trafficLimitBytes') or data_dict.get('traffic_limit_bytes') or 0
+            
+            # Конвертируем в ГБ для отображения
+            def bytes_to_gb(bytes_val):
+                if not bytes_val or bytes_val == 0:
+                    return 0
+                return round(bytes_val / (1024 ** 3), 2)
+            
+            user_data['traffic_used'] = used_traffic_bytes
+            user_data['traffic_used_gb'] = bytes_to_gb(used_traffic_bytes)
+            user_data['traffic_limit'] = traffic_limit_bytes
+            user_data['traffic_limit_gb'] = bytes_to_gb(traffic_limit_bytes) if traffic_limit_bytes > 0 else None
+            user_data['traffic_used_label'] = f"{bytes_to_gb(used_traffic_bytes)} ГБ" if used_traffic_bytes else "0.00 ГБ"
+            user_data['traffic_limit_label'] = f"{bytes_to_gb(traffic_limit_bytes)} ГБ" if traffic_limit_bytes > 0 else "Безлимит"
+            
+            # Добавляем данные о серверах и устройствах
+            user_data['connected_squads'] = data_dict.get('activeInternalSquads') or data_dict.get('active_internal_squads') or []
+            user_data['servers_count'] = len(user_data['connected_squads'])
+            user_data['devices_count'] = data_dict.get('hwidDeviceLimit') or data_dict.get('hwid_device_limit') or 0
+            
+            # Добавляем все остальные поля из data_dict в user_data
+            for key, value in data_dict.items():
+                if key not in user_data:
+                    user_data[key] = value
+            
+            # Формируем финальный ответ в формате, ожидаемом miniapp
+            result = {
+                'user': user_data,
+                'subscription_url': data_dict.get('subscriptionUrl') or data_dict.get('subscription_url'),
+                'subscription_missing': not has_active_subscription,
+                'subscriptionMissing': not has_active_subscription,
+                'uuid': user_data['uuid'],
+                'email': user_data['email'],
+                'username': user_data['username'],
+                'expireAt': expire_at
+            }
+            
+            # Добавляем все остальные поля из data_dict в result (для обратной совместимости)
+            for key, value in data_dict.items():
+                if key not in result:
+                    result[key] = value
+            
+            return result
+        
+        # Получаем данные пользователя из RemnaWave (аналогично get_client_me)
+        current_uuid = user.remnawave_uuid
+        
+        # Проверяем кэш
+        cache_key = f'live_data_{current_uuid}'
+        if cached := cache.get(cache_key):
+            # Адаптируем данные для miniapp
+            response_data = adapt_data_for_miniapp(cached.copy(), user)
+            response = jsonify(response_data)
+            # Добавляем CORS заголовки для miniapp
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+            response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+            return response, 200
+        
+        # Получаем данные из RemnaWave API
+        try:
+            resp = requests.get(
+                f"{API_URL}/api/users/{current_uuid}",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                timeout=10
+            )
+            
+            if resp.status_code != 200:
+                if resp.status_code == 404:
+                    return jsonify({
+                        "detail": {
+                            "title": "Subscription Not Found",
+                            "message": "User not found in VPN system. Please contact support."
+                        }
+                    }), 404
+                return jsonify({
+                    "detail": {
+                        "title": "Subscription Not Found",
+                        "message": f"Failed to fetch subscription data: {resp.status_code}"
+                    }
+                }), 500
+            
+            response_data = resp.json()
+            data = response_data.get('response', {}) if isinstance(response_data, dict) else response_data
+            
+            # Адаптируем данные для miniapp
+            if isinstance(data, dict):
+                data = adapt_data_for_miniapp(data, user)
+            
+            # Кэшируем на 5 минут (сохраняем оригинальные данные без адаптации)
+            cache_data = data.copy()
+            # Убираем поля, которые мы добавили для miniapp, чтобы не дублировать в кэше
+            cache_data.pop('subscription_missing', None)
+            cache_data.pop('subscriptionMissing', None)
+            cache.set(cache_key, cache_data, timeout=300)
+            
+            print(f"[MINIAPP] Successfully fetched subscription data for user {telegram_id}")
+            print(f"[MINIAPP] Response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+            if isinstance(data, dict):
+                print(f"[MINIAPP] Sample fields: expireAt={data.get('expireAt')}, subscription_missing={data.get('subscription_missing')}, uuid={bool(data.get('uuid'))}")
+            
+            response = jsonify(data)
+            # Добавляем CORS заголовки для miniapp
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+            response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+            return response, 200
+            
+        except requests.RequestException as e:
+            print(f"Request Error in miniapp_subscription: {e}")
+            return jsonify({
+                "detail": {
+                    "title": "Subscription Not Found",
+                    "message": f"Failed to connect to VPN system: {str(e)}"
+                }
+            }), 500
+        except Exception as e:
+            print(f"Error in miniapp_subscription: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "detail": {
+                    "title": "Subscription Not Found",
+                    "message": "Internal server error"
+                }
+            }), 500
+            
+    except Exception as e:
+        print(f"Error parsing initData: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "detail": {
+                "title": "Authorization Error",
+                "message": "Invalid initData format."
+            }
+        }), 401
+
+def get_miniapp_path():
+    """
+    Получить путь к папке miniapp.
+    Проверяет переменную окружения и стандартные пути.
+    Учитывает различные варианты размещения miniapp.
+    """
+    import os
+    
+    # 1. Из переменной окружения (приоритет)
+    miniapp_path = os.getenv("MINIAPP_PATH", "")
+    if miniapp_path:
+        # Убираем пробелы и проверяем
+        miniapp_path = miniapp_path.strip()
+        if miniapp_path and os.path.isdir(miniapp_path):
+            index_path = os.path.join(miniapp_path, 'index.html')
+            if os.path.exists(index_path):
+                print(f"[MINIAPP] Using path from MINIAPP_PATH: {miniapp_path}")
+                return miniapp_path
+            else:
+                print(f"[MINIAPP] MINIAPP_PATH set to {miniapp_path}, but index.html not found")
+    
+    # 2. Базовый путь от текущего файла
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 3. Стандартные пути (в порядке приоритета)
+    possible_paths = [
+        # Пользовательские пути (из сообщений)
+        os.path.join('/var/www', 'stealthnet-client', 'build', 'miniapp'),
+        os.path.join('/opt', 'admin-panel', 'build', 'miniapp'),
+        
+        # Относительно текущего файла
+        os.path.join(base_dir, 'admin-panel', 'build', 'miniapp'),
+        os.path.join(base_dir, 'miniapp'),
+        
+        # Стандартные системные пути
+        os.path.join('/var/www', 'admin-panel', 'build', 'miniapp'),
+        os.path.join('/var/www', 'miniapp'),
+        os.path.join('/srv', 'admin-panel', 'build', 'miniapp'),
+        os.path.join('/srv', 'miniapp'),
+        os.path.join('/opt', 'miniapp'),
+        os.path.join('/opt', 'stealthnet', 'admin-panel', 'build', 'miniapp'),
+        os.path.join('/opt', 'stealthnet-client', 'build', 'miniapp'),
+        os.path.join(os.path.expanduser('~'), 'admin-panel', 'build', 'miniapp'),
+        os.path.join(os.path.expanduser('~'), 'miniapp'),
+    ]
+    
+    # Убираем дубликаты, сохраняя порядок
+    seen = set()
+    unique_paths = []
+    for path in possible_paths:
+        if path not in seen:
+            seen.add(path)
+            unique_paths.append(path)
+    
+    # Проверяем каждый путь
+    for path in unique_paths:
+        if os.path.isdir(path):
+            index_path = os.path.join(path, 'index.html')
+            if os.path.exists(index_path):
+                print(f"[MINIAPP] Found miniapp at: {path}")
+                return path
+            else:
+                # Логируем, если директория существует, но index.html нет
+                print(f"[MINIAPP] Directory exists but no index.html: {path}")
+    
+    # Если ничего не найдено, выводим список проверенных путей
+    print(f"[MINIAPP] Miniapp directory not found in any of the checked paths:")
+    for path in unique_paths:
+        exists = os.path.exists(path)
+        is_dir = os.path.isdir(path) if exists else False
+        print(f"  - {path} {'(exists, dir)' if is_dir else '(exists, not dir)' if exists else '(not found)'}")
+    
+    return None
+
+@app.route('/miniapp/app-config.json', methods=['GET'])
+@app.route('/app-config.json', methods=['GET'])
+def miniapp_app_config():
+    """
+    Эндпоинт для отдачи конфигурации miniapp (app-config.json).
+    Поддерживает несколько путей для поиска файла.
+    """
+    import json
+    import os
+    
+    # Возможные пути к файлу app-config.json
+    # 1. Из переменной окружения (если указана)
+    miniapp_path = os.getenv("MINIAPP_PATH", "")
+    
+    # 2. Базовый путь от текущего файла
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Список возможных путей для поиска
+    possible_paths = []
+    
+    # Если указан путь в переменной окружения
+    if miniapp_path:
+        possible_paths.append(os.path.join(miniapp_path, 'app-config.json'))
+        possible_paths.append(os.path.join(miniapp_path, 'miniapp', 'app-config.json'))
+    
+    # Стандартные пути относительно текущего файла
+    possible_paths.extend([
+        # Пользовательские пути (из сообщений)
+        os.path.join('/var/www', 'stealthnet-client', 'build', 'miniapp', 'app-config.json'),
+        os.path.join('/opt', 'admin-panel', 'build', 'miniapp', 'app-config.json'),
+        
+        # Относительно текущего файла
+        os.path.join(base_dir, 'admin-panel', 'build', 'miniapp', 'app-config.json'),
+        os.path.join(base_dir, 'miniapp', 'app-config.json'),
+        os.path.join(base_dir, 'app-config.json'),
+        
+        # Стандартные системные пути
+        os.path.join('/var/www', 'admin-panel', 'build', 'miniapp', 'app-config.json'),
+        os.path.join('/var/www', 'miniapp', 'app-config.json'),
+        os.path.join('/srv', 'admin-panel', 'build', 'miniapp', 'app-config.json'),
+        os.path.join('/srv', 'miniapp', 'app-config.json'),
+        os.path.join('/opt', 'miniapp', 'app-config.json'),
+        os.path.join('/opt', 'stealthnet', 'admin-panel', 'build', 'miniapp', 'app-config.json'),
+        os.path.join('/opt', 'stealthnet-client', 'build', 'miniapp', 'app-config.json'),
+        os.path.join(os.path.expanduser('~'), 'admin-panel', 'build', 'miniapp', 'app-config.json'),
+        os.path.join(os.path.expanduser('~'), 'miniapp', 'app-config.json'),
+    ])
+    
+    # Убираем дубликаты, сохраняя порядок
+    seen = set()
+    unique_paths = []
+    for path in possible_paths:
+        if path not in seen:
+            seen.add(path)
+            unique_paths.append(path)
+    
+    config_data = None
+    found_path = None
+    
+    # Пытаемся найти файл по одному из путей
+    for config_path in unique_paths:
+        try:
+            if os.path.exists(config_path) and os.path.isfile(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+                found_path = config_path
+                print(f"[MINIAPP] Found app-config.json at: {config_path}")
+                break
+        except (FileNotFoundError, PermissionError) as e:
+            continue
+        except json.JSONDecodeError as e:
+            print(f"[MINIAPP] Error parsing JSON from {config_path}: {e}")
+            continue
+        except Exception as e:
+            print(f"[MINIAPP] Error reading {config_path}: {e}")
+            continue
+    
+    # Если файл не найден, создаем базовую конфигурацию
+    if config_data is None:
+        print(f"[MINIAPP] app-config.json not found in any of the checked paths:")
+        for path in unique_paths:
+            print(f"  - {path}")
+        print(f"[MINIAPP] Using default configuration")
+        
+        # Создаем базовую конфигурацию
+        config_data = {
+            "config": {
+                "additionalLocales": ["ru", "zh", "fa"],
+                "branding": {
+                    "name": "StealthNET",
+                    "logoUrl": "",
+                    "supportUrl": "https://t.me"
+                }
+            },
+            "platforms": {
+                "ios": [],
+                "android": [],
+                "macos": [],
+                "windows": [],
+                "linux": [],
+                "androidTV": [],
+                "appleTV": []
+            }
+        }
+    
+    # Обновляем branding из базы данных, если есть
+    try:
+        branding = BrandingSetting.query.first()
+        if branding:
+            if 'config' not in config_data:
+                config_data['config'] = {}
+            if 'branding' not in config_data['config']:
+                config_data['config']['branding'] = {}
+            
+            config_data['config']['branding']['name'] = branding.site_name or "StealthNET"
+            if branding.logo_url:
+                config_data['config']['branding']['logoUrl'] = branding.logo_url
+            # supportUrl можно оставить как есть или добавить в BrandingSetting
+    except Exception as e:
+        print(f"[MINIAPP] Error updating branding from database: {e}")
+    
+    response = jsonify(config_data)
+    # Добавляем CORS заголовки
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Content-Type', 'application/json')
+    return response
+
+@app.route('/miniapp/maintenance/status', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_maintenance_status():
+    """
+    Эндпоинт для проверки статуса технического обслуживания в Telegram Mini App.
+    """
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    print(f"[MINIAPP] POST /miniapp/maintenance/status received")
+    try:
+        # Просто возвращаем, что обслуживание не активно
+        # В будущем можно добавить логику проверки статуса обслуживания
+        return jsonify({
+            "isActive": False,
+            "is_active": False,
+            "message": None
+        }), 200
+    except Exception as e:
+        print(f"Error in miniapp_maintenance_status: {e}")
+        return jsonify({
+            "isActive": False,
+            "is_active": False,
+            "message": None
+        }), 200
+
+@app.route('/miniapp/subscription/trial', methods=['POST'])
+@limiter.limit("10 per minute")
+def miniapp_activate_trial():
+    """
+    Эндпоинт для активации триала через Telegram Mini App.
+    """
+    try:
+        data = request.json
+        init_data = data.get('initData', '')
+        
+        if not init_data:
+            return jsonify({
+                "success": False,
+                "message": "Missing initData. Please open the mini app from Telegram."
+            }), 401
+        
+        # Парсим initData
+        import urllib.parse
+        import json as json_lib
+        
+        parsed_data = urllib.parse.parse_qs(init_data)
+        user_str = parsed_data.get('user', [''])[0]
+        
+        if not user_str:
+            return jsonify({
+                "success": False,
+                "message": "Invalid initData format."
+            }), 401
+        
+        try:
+            user_data = json_lib.loads(urllib.parse.unquote(user_str))
+            telegram_id = user_data.get('id')
+        except (json_lib.JSONDecodeError, KeyError):
+            return jsonify({
+                "success": False,
+                "message": "Invalid user data in initData."
+            }), 401
+        
+        if not telegram_id:
+            return jsonify({
+                "success": False,
+                "message": "Telegram ID not found in initData."
+            }), 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        
+        if not user:
+            return jsonify({
+                "success": False,
+                "message": "User not registered. Please register in the bot first."
+            }), 404
+        
+        # Активируем триал (аналогично activate_trial)
+        new_exp = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        
+        referral_settings = ReferralSetting.query.first()
+        trial_squad_id = DEFAULT_SQUAD_ID
+        if referral_settings and referral_settings.trial_squad_id:
+            trial_squad_id = referral_settings.trial_squad_id
+        
+        patch_resp = requests.patch(
+            f"{API_URL}/api/users",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            json={"uuid": user.remnawave_uuid, "expireAt": new_exp, "activeInternalSquads": [trial_squad_id]},
+            timeout=10
+        )
+        
+        if patch_resp.status_code != 200:
+            return jsonify({
+                "success": False,
+                "message": "Failed to activate trial. Please try again later."
+            }), 500
+        
+        # Очищаем кэш
+        cache.delete(f'live_data_{user.remnawave_uuid}')
+        cache.delete('all_live_users_map')
+        cache.delete(f'nodes_{user.remnawave_uuid}')
+        
+        return jsonify({
+            "success": True,
+            "message": "Trial activated successfully. You received 3 days of premium access."
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in miniapp_activate_trial: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "message": "Internal server error"
+        }), 500
+
+# --- MINIAPP PAYMENT ENDPOINTS ---
+@app.route('/miniapp/payments/methods', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_payment_methods():
+    """Получить список доступных способов оплаты для miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        # Получаем доступные методы оплаты
+        s = PaymentSetting.query.first()
+        if not s:
+            return jsonify({"methods": []}), 200
+        
+        available = []
+        
+        # CrystalPay
+        crystalpay_key = decrypt_key(s.crystalpay_api_key) if s.crystalpay_api_key else None
+        crystalpay_secret = decrypt_key(s.crystalpay_api_secret) if s.crystalpay_api_secret else None
+        if crystalpay_key and crystalpay_secret and crystalpay_key != "DECRYPTION_ERROR" and crystalpay_secret != "DECRYPTION_ERROR":
+            available.append({"id": "crystalpay", "name": "CrystalPay", "type": "redirect"})
+        
+        # Heleket
+        heleket_key = decrypt_key(s.heleket_api_key) if s.heleket_api_key else None
+        if heleket_key and heleket_key != "DECRYPTION_ERROR":
+            available.append({"id": "heleket", "name": "Heleket", "type": "redirect"})
+        
+        # YooKassa
+        yookassa_shop = decrypt_key(s.yookassa_shop_id) if s.yookassa_shop_id else None
+        yookassa_secret = decrypt_key(s.yookassa_secret_key) if s.yookassa_secret_key else None
+        if yookassa_shop and yookassa_secret and yookassa_shop != "DECRYPTION_ERROR" and yookassa_secret != "DECRYPTION_ERROR":
+            available.append({"id": "yookassa", "name": "YooKassa", "type": "redirect"})
+        
+        # Platega
+        platega_key = decrypt_key(s.platega_api_key) if s.platega_api_key else None
+        platega_merchant = decrypt_key(s.platega_merchant_id) if s.platega_merchant_id else None
+        if platega_key and platega_merchant and platega_key != "DECRYPTION_ERROR" and platega_merchant != "DECRYPTION_ERROR":
+            available.append({"id": "platega", "name": "Platega", "type": "redirect"})
+        
+        # Mulenpay
+        mulenpay_key = decrypt_key(s.mulenpay_api_key) if s.mulenpay_api_key else None
+        mulenpay_secret = decrypt_key(s.mulenpay_secret_key) if s.mulenpay_secret_key else None
+        mulenpay_shop = decrypt_key(s.mulenpay_shop_id) if s.mulenpay_shop_id else None
+        if mulenpay_key and mulenpay_secret and mulenpay_shop and mulenpay_key != "DECRYPTION_ERROR" and mulenpay_secret != "DECRYPTION_ERROR" and mulenpay_shop != "DECRYPTION_ERROR":
+            available.append({"id": "mulenpay", "name": "MulenPay", "type": "redirect"})
+        
+        # UrlPay
+        urlpay_key = decrypt_key(s.urlpay_api_key) if s.urlpay_api_key else None
+        urlpay_secret = decrypt_key(s.urlpay_secret_key) if s.urlpay_secret_key else None
+        urlpay_shop = decrypt_key(s.urlpay_shop_id) if s.urlpay_shop_id else None
+        if urlpay_key and urlpay_secret and urlpay_shop and urlpay_key != "DECRYPTION_ERROR" and urlpay_secret != "DECRYPTION_ERROR" and urlpay_shop != "DECRYPTION_ERROR":
+            available.append({"id": "urlpay", "name": "UrlPay", "type": "redirect"})
+        
+        # Telegram Stars
+        telegram_token = decrypt_key(s.telegram_bot_token) if s.telegram_bot_token else None
+        if telegram_token and telegram_token != "DECRYPTION_ERROR":
+            available.append({"id": "telegram_stars", "name": "Telegram Stars", "type": "telegram"})
+        
+        # Monobank
+        monobank_token = decrypt_key(s.monobank_token) if s.monobank_token else None
+        if monobank_token and monobank_token != "DECRYPTION_ERROR":
+            available.append({"id": "monobank", "name": "Monobank", "type": "card"})
+        
+        response = jsonify({"methods": available})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+    except Exception as e:
+        print(f"Error in miniapp_payment_methods: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({"methods": []})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+@app.route('/miniapp/payments/create', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def miniapp_create_payment():
+    """Создать платеж через miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        # Парсим initData для получения пользователя
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            data = dict(request.form)
+        elif request.data:
+            try:
+                import json as json_lib
+                data = json_lib.loads(request.data.decode('utf-8'))
+            except:
+                pass
+        
+        init_data = data.get('initData') or request.headers.get('X-Telegram-Init-Data') or request.headers.get('X-Init-Data') or request.args.get('initData')
+        
+        if not init_data:
+            # Пробуем получить из initDataUnsafe
+            init_data_unsafe = data.get('initDataUnsafe', {})
+            if isinstance(init_data_unsafe, dict) and init_data_unsafe.get('user'):
+                user_data = init_data_unsafe['user']
+                telegram_id = user_data.get('id')
+            else:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Missing initData. Please open the mini app from Telegram."
+                    }
+                }), 401
+        else:
+            # Парсим initData
+            import urllib.parse
+            import json as json_lib
+            
+            if isinstance(init_data, dict):
+                parsed_data = init_data
+            else:
+                parsed_data = urllib.parse.parse_qs(init_data)
+            
+            user_str = parsed_data.get('user', [''])[0] if isinstance(parsed_data, dict) and 'user' in parsed_data else None
+            if not user_str and isinstance(parsed_data, dict):
+                user_str = parsed_data.get('user')
+            
+            if not user_str:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid initData format."
+                    }
+                }), 401
+            
+            try:
+                if isinstance(user_str, str):
+                    user_data = json_lib.loads(urllib.parse.unquote(user_str))
+                else:
+                    user_data = user_str
+                telegram_id = user_data.get('id')
+            except (json_lib.JSONDecodeError, KeyError, TypeError):
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid user data in initData."
+                    }
+                }), 401
+        
+        if not telegram_id:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Telegram ID not found in initData."
+                }
+            }), 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered. Please register in the bot first."
+                }
+            }), 404
+        
+        # Получаем параметры платежа
+        tariff_id = data.get('tariff_id') or data.get('tariffId')
+        payment_provider = data.get('payment_provider') or data.get('paymentProvider', 'crystalpay')
+        promo_code_str = data.get('promo_code') or data.get('promoCode', '').strip().upper() if data.get('promo_code') or data.get('promoCode') else None
+        
+        if not tariff_id:
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Request",
+                    "message": "tariff_id is required"
+                }
+            }), 400
+        
+        try:
+            tariff_id = int(tariff_id)
+        except (ValueError, TypeError):
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Request",
+                    "message": "Invalid tariff_id"
+                }
+            }), 400
+        
+        # Получаем тариф
+        t = db.session.get(Tariff, tariff_id)
+        if not t:
+            return jsonify({
+                "detail": {
+                    "title": "Not Found",
+                    "message": "Tariff not found"
+                }
+            }), 404
+        
+        # Определяем цену в зависимости от валюты пользователя
+        price_map = {"uah": {"a": t.price_uah, "c": "UAH"}, "rub": {"a": t.price_rub, "c": "RUB"}, "usd": {"a": t.price_usd, "c": "USD"}}
+        info = price_map.get(user.preferred_currency, price_map['uah'])
+        
+        # Применяем промокод со скидкой, если указан
+        promo_code_obj = None
+        final_amount = info['a']
+        if promo_code_str:
+            promo = PromoCode.query.filter_by(code=promo_code_str).first()
+            if not promo:
+                return jsonify({
+                    "detail": {
+                        "title": "Invalid Promo Code",
+                        "message": "Неверный промокод"
+                    }
+                }), 400
+            if promo.uses_left <= 0:
+                return jsonify({
+                    "detail": {
+                        "title": "Invalid Promo Code",
+                        "message": "Промокод больше не действителен"
+                    }
+                }), 400
+            if promo.promo_type == 'PERCENT':
+                discount = (promo.value / 100.0) * final_amount
+                final_amount = final_amount - discount
+                if final_amount < 0:
+                    final_amount = 0
+                promo_code_obj = promo
+            elif promo.promo_type == 'DAYS':
+                return jsonify({
+                    "detail": {
+                        "title": "Invalid Promo Code",
+                        "message": "Промокод на бесплатные дни активируется отдельно"
+                    }
+                }), 400
+        
+        # Создаем платеж (используем логику из create_payment)
+        s = PaymentSetting.query.first()
+        order_id = f"u{user.id}-t{t.id}-{int(datetime.now().timestamp())}"
+        payment_url = None
+        payment_system_id = None
+        
+        # Используем ту же логику создания платежа, что и в create_payment
+        if payment_provider == 'heleket':
+            # Heleket API
+            heleket_key = decrypt_key(s.heleket_api_key) if s else None
+            if not heleket_key or heleket_key == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Heleket API key not configured"
+                    }
+                }), 500
+            
+            heleket_currency = info['c']
+            to_currency = None
+            
+            if info['c'] == 'USD':
+                heleket_currency = "USD"
+            else:
+                heleket_currency = "USD"
+                to_currency = "USDT"
+            
+            payload = {
+                "amount": f"{final_amount:.2f}",
+                "currency": heleket_currency,
+                "order_id": order_id,
+                "url_return": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/",
+                "url_callback": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/heleket"
+            }
+            
+            if to_currency:
+                payload["to_currency"] = to_currency
+            
+            headers = {
+                "Authorization": f"Bearer {heleket_key}",
+                "Content-Type": "application/json"
+            }
+            
+            resp = requests.post("https://api.heleket.com/v1/payment", json=payload, headers=headers).json()
+            if resp.get('state') != 0 or not resp.get('result'):
+                error_msg = resp.get('message', 'Payment Provider Error')
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": error_msg
+                    }
+                }), 500
+            
+            result = resp.get('result', {})
+            payment_url = result.get('url')
+            payment_system_id = result.get('uuid')
+            
+        elif payment_provider == 'telegram_stars':
+            # Telegram Stars API
+            bot_token = decrypt_key(s.telegram_bot_token) if s else None
+            if not bot_token or bot_token == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Telegram Bot Token not configured"
+                    }
+                }), 500
+            
+            stars_amount = int(final_amount * 100)
+            if info['c'] == 'UAH':
+                stars_amount = int(final_amount * 2.7)
+            elif info['c'] == 'RUB':
+                stars_amount = int(final_amount * 1.1)
+            elif info['c'] == 'USD':
+                stars_amount = int(final_amount * 100)
+            
+            if stars_amount < 1:
+                stars_amount = 1
+            
+            invoice_payload = {
+                "title": f"Подписка StealthNET - {t.name}",
+                "description": f"Подписка на {t.duration_days} дней",
+                "payload": order_id,
+                "provider_token": "",
+                "currency": "XTR",
+                "prices": [
+                    {
+                        "label": f"Подписка {t.duration_days} дней",
+                        "amount": stars_amount
+                    }
+                ]
+            }
+            
+            resp = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/createInvoiceLink",
+                json=invoice_payload,
+                headers={"Content-Type": "application/json"}
+            ).json()
+            
+            if not resp.get('ok'):
+                error_msg = resp.get('description', 'Telegram Bot API Error')
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": error_msg
+                    }
+                }), 500
+            
+            payment_url = resp.get('result')
+            payment_system_id = order_id
+            
+        elif payment_provider == 'yookassa':
+            # YooKassa API
+            shop_id = decrypt_key(s.yookassa_shop_id) if s else None
+            secret_key = decrypt_key(s.yookassa_secret_key) if s else None
+            
+            if not shop_id or not secret_key or shop_id == "DECRYPTION_ERROR" or secret_key == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "YooKassa credentials not configured"
+                    }
+                }), 500
+            
+            if info['c'] != 'RUB':
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "YooKassa supports only RUB currency"
+                    }
+                }), 400
+            
+            import uuid
+            import base64
+            idempotence_key = str(uuid.uuid4())
+            
+            payload = {
+                "amount": {
+                    "value": f"{final_amount:.2f}",
+                    "currency": "RUB"
+                },
+                "capture": True,
+                "confirmation": {
+                    "type": "redirect",
+                    "return_url": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/"
+                },
+                "description": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                "metadata": {
+                    "order_id": order_id,
+                    "user_id": str(user.id),
+                    "tariff_id": str(t.id)
+                }
+            }
+            
+            auth_string = f"{shop_id}:{secret_key}"
+            auth_b64 = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
+            
+            headers = {
+                "Authorization": f"Basic {auth_b64}",
+                "Idempotence-Key": idempotence_key,
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.yookassa.ru/v3/payments",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                if payment_data.get('status') != 'pending':
+                    error_msg = payment_data.get('description', 'YooKassa payment creation failed')
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+                
+                confirmation = payment_data.get('confirmation', {})
+                payment_url = confirmation.get('confirmation_url')
+                payment_system_id = payment_data.get('id')
+                
+                if not payment_url:
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": "Failed to get payment URL from YooKassa"
+                        }
+                    }), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('description', str(e))
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"YooKassa API Error: {error_msg}"
+                    }
+                }), 500
+        
+        elif payment_provider == 'platega':
+            # Platega API
+            import uuid
+            api_key = decrypt_key(s.platega_api_key) if s else None
+            merchant_id = decrypt_key(s.platega_merchant_id) if s else None
+            
+            if not api_key or not merchant_id or api_key == "DECRYPTION_ERROR" or merchant_id == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Platega credentials not configured"
+                    }
+                }), 500
+            
+            transaction_uuid = str(uuid.uuid4())
+            
+            # Формируем payload согласно документации Platega API
+            payload = {
+                "paymentMethod": 2,  # 2 - СБП/QR, 10 - CardRu, 12 - International
+                "id": transaction_uuid,
+                "paymentDetails": {
+                    "amount": int(final_amount),
+                    "currency": info['c']
+                },
+                "description": f"Payment for order {transaction_uuid}",
+                "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://panel.stealthnet.app/dashboard/subscription",
+                "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://panel.stealthnet.app/dashboard/subscription"
+            }
+            
+            # Заголовки согласно документации Platega API
+            headers = {
+                "Content-Type": "application/json",
+                "X-MerchantId": merchant_id,
+                "X-Secret": api_key
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://app.platega.io/transaction/process",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                payment_url = payment_data.get('redirect')
+                payment_system_id = payment_data.get('transactionId') or transaction_uuid
+                
+                if not payment_url:
+                    error_msg = payment_data.get('message', 'Failed to get payment URL from Platega')
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+            except requests.exceptions.ConnectionError as e:
+                # Обработка DNS ошибок и проблем с подключением
+                error_msg = str(e)
+                if "Name or service not known" in error_msg or "Failed to resolve" in error_msg:
+                    print(f"Platega API DNS Error: {e}")
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": "Platega API недоступен. Проверьте настройки DNS или свяжитесь с поддержкой."
+                        }
+                    }), 503  # Service Unavailable
+                else:
+                    print(f"Platega API Connection Error: {e}")
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": "Не удалось подключиться к Platega API. Проверьте интернет-соединение."
+                        }
+                    }), 503
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message', str(e))
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"Platega API Error: {error_msg}"
+                    }
+                }), 500
+        
+        elif payment_provider == 'mulenpay':
+            # Mulenpay API
+            api_key = decrypt_key(s.mulenpay_api_key) if s else None
+            secret_key = decrypt_key(s.mulenpay_secret_key) if s else None
+            shop_id = decrypt_key(s.mulenpay_shop_id) if s else None
+            
+            if not api_key or not secret_key or not shop_id or api_key == "DECRYPTION_ERROR" or secret_key == "DECRYPTION_ERROR" or shop_id == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Mulenpay credentials not configured"
+                    }
+                }), 500
+            
+            currency_map = {'RUB': 'rub', 'UAH': 'uah', 'USD': 'usd'}
+            mulenpay_currency = currency_map.get(info['c'], info['c'].lower())
+            
+            try:
+                shop_id_int = int(shop_id)
+            except (ValueError, TypeError):
+                shop_id_int = shop_id
+            
+            payload = {
+                "currency": mulenpay_currency,
+                "amount": str(final_amount),
+                "uuid": order_id,
+                "shopId": shop_id_int,
+                "description": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                "subscribe": None,
+                "holdTime": None
+            }
+            
+            import base64
+            auth_string = f"{api_key}:{secret_key}"
+            auth_b64 = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
+            
+            headers = {
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.mulenpay.ru/v2/payments",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                payment_url = payment_data.get('url') or payment_data.get('payment_url') or payment_data.get('redirect')
+                payment_system_id = payment_data.get('id') or payment_data.get('payment_id') or order_id
+                
+                if not payment_url:
+                    error_msg = payment_data.get('message') or payment_data.get('error') or 'Failed to get payment URL from Mulenpay'
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"Mulenpay API Error: {error_msg}"
+                    }
+                }), 500
+        
+        elif payment_provider == 'urlpay':
+            # UrlPay API
+            api_key = decrypt_key(s.urlpay_api_key) if s else None
+            secret_key = decrypt_key(s.urlpay_secret_key) if s else None
+            shop_id = decrypt_key(s.urlpay_shop_id) if s else None
+            
+            if not api_key or not secret_key or not shop_id or api_key == "DECRYPTION_ERROR" or secret_key == "DECRYPTION_ERROR" or shop_id == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "UrlPay credentials not configured"
+                    }
+                }), 500
+            
+            currency_map = {'RUB': 'rub', 'UAH': 'uah', 'USD': 'usd'}
+            urlpay_currency = currency_map.get(info['c'], info['c'].lower())
+            
+            try:
+                shop_id_int = int(shop_id)
+            except (ValueError, TypeError):
+                shop_id_int = shop_id
+            
+            payload = {
+                "currency": urlpay_currency,
+                "amount": str(final_amount),
+                "uuid": order_id,
+                "shopId": shop_id_int,
+                "description": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                "subscribe": None,
+                "holdTime": None
+            }
+            
+            import base64
+            auth_string = f"{api_key}:{secret_key}"
+            auth_b64 = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
+            
+            headers = {
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.urlpay.io/v2/payments",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                payment_url = payment_data.get('url') or payment_data.get('payment_url') or payment_data.get('redirect')
+                payment_system_id = payment_data.get('id') or payment_data.get('payment_id') or order_id
+                
+                if not payment_url:
+                    error_msg = payment_data.get('message') or payment_data.get('error') or 'Failed to get payment URL from UrlPay'
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"UrlPay API Error: {error_msg}"
+                    }
+                }), 500
+        
+        elif payment_provider == 'monobank':
+            # Monobank API
+            monobank_token = decrypt_key(s.monobank_token) if s else None
+            if not monobank_token or monobank_token == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Monobank token not configured"
+                    }
+                }), 500
+            
+            # Monobank принимает сумму в копейках (минимальных единицах)
+            # Конвертируем сумму в копейки
+            amount_in_kopecks = int(final_amount * 100)
+            if info['c'] == 'UAH':
+                amount_in_kopecks = int(final_amount * 100)  # UAH в копейках
+            elif info['c'] == 'RUB':
+                amount_in_kopecks = int(final_amount * 100)  # RUB в копейках
+            elif info['c'] == 'USD':
+                amount_in_kopecks = int(final_amount * 100)  # USD в центах
+            
+            # Код валюты по ISO 4217: 980 = UAH, 643 = RUB, 840 = USD
+            currency_code = 980  # По умолчанию UAH
+            if info['c'] == 'RUB':
+                currency_code = 643
+            elif info['c'] == 'USD':
+                currency_code = 840
+            
+            # Создаем инвойс через Monobank API
+            payload = {
+                "amount": amount_in_kopecks,
+                "ccy": currency_code,
+                "merchantPaymInfo": {
+                    "reference": order_id,
+                    "destination": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                    "basketOrder": [
+                        {
+                            "name": f"Подписка {t.name}",
+                            "qty": 1,
+                            "sum": amount_in_kopecks,
+                            "unit": "шт"
+                        }
+                    ]
+                },
+                "redirectUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/",
+                "webHookUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/monobank",
+                "validity": 86400,  # 24 часа в секундах
+                "paymentType": "debit"
+            }
+            
+            headers = {
+                "X-Token": monobank_token,
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.monobank.ua/api/merchant/invoice/create",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                payment_url = payment_data.get('pageUrl')
+                payment_system_id = payment_data.get('invoiceId') or order_id
+                
+                if not payment_url:
+                    error_msg = payment_data.get('errText') or 'Failed to get payment URL from Monobank'
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('errText') or error_data.get('message') or str(e)
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"Monobank API Error: {error_msg}"
+                    }
+                }), 500
+        
+        else:
+            # CrystalPay API (по умолчанию)
+            login = decrypt_key(s.crystalpay_api_key) if s else None
+            secret = decrypt_key(s.crystalpay_api_secret) if s else None
+            
+            if not login or not secret or login == "DECRYPTION_ERROR" or secret == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "CrystalPay not configured"
+                    }
+                }), 500
+            
+            payload = {
+                "auth_login": login, "auth_secret": secret,
+                "amount": f"{final_amount:.2f}", "type": "purchase", "currency": info['c'],
+                "lifetime": 60, "extra": order_id, 
+                "callback_url": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/crystalpay",
+                "redirect_url": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/"
+            }
+            
+            resp = requests.post("https://api.crystalpay.io/v3/invoice/create/", json=payload).json()
+            if resp.get('errors'): 
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Failed to create payment"
+                    }
+                }), 500
+            
+            payment_url = resp.get('url')
+            payment_system_id = resp.get('id')
+        
+        if not payment_url:
+            return jsonify({
+                "detail": {
+                    "title": "Payment Error",
+                    "message": "Failed to create payment"
+                }
+            }), 500
+        
+        # Создаем запись о платеже
+        new_p = Payment(
+            order_id=order_id, 
+            user_id=user.id, 
+            tariff_id=t.id, 
+            status='PENDING', 
+            amount=final_amount, 
+            currency=info['c'], 
+            payment_system_id=payment_system_id,
+            payment_provider=payment_provider,
+            promo_code_id=promo_code_obj.id if promo_code_obj else None
+        )
+        db.session.add(new_p)
+        db.session.commit()
+        
+        response = jsonify({
+            "payment_url": payment_url,
+            "payment_id": payment_system_id,
+            "order_id": order_id
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+        
+    except Exception as e:
+        print(f"Error in miniapp_create_payment: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "detail": {
+                "title": "Internal Server Error",
+                "message": "An error occurred while processing the request."
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+@app.route('/miniapp/payments/status', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_payment_status():
+    """Получить статус платежа для miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            data = dict(request.form)
+        elif request.data:
+            try:
+                import json as json_lib
+                data = json_lib.loads(request.data.decode('utf-8'))
+            except:
+                pass
+        
+        payment_id = data.get('payment_id') or data.get('paymentId') or data.get('order_id') or data.get('orderId')
+        
+        if not payment_id:
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Request",
+                    "message": "payment_id is required"
+                }
+            }), 400
+        
+        # Находим платеж
+        p = Payment.query.filter_by(order_id=payment_id).first()
+        if not p:
+            p = Payment.query.filter_by(payment_system_id=payment_id).first()
+        
+        if not p:
+            return jsonify({
+                "status": "not_found",
+                "paid": False
+            }), 200
+        
+        response = jsonify({
+            "status": p.status.lower(),
+            "paid": p.status == 'PAID',
+            "order_id": p.order_id,
+            "amount": p.amount,
+            "currency": p.currency
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+        
+    except Exception as e:
+        print(f"Error in miniapp_payment_status: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "status": "error",
+            "paid": False
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+@app.route('/miniapp/promo-codes/activate', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def miniapp_activate_promocode():
+    """Активировать промокод через miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        # Парсим initData
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            data = dict(request.form)
+        elif request.data:
+            try:
+                import json as json_lib
+                data = json_lib.loads(request.data.decode('utf-8'))
+            except:
+                pass
+        
+        init_data = data.get('initData') or request.headers.get('X-Telegram-Init-Data') or request.headers.get('X-Init-Data') or request.args.get('initData')
+        
+        if not init_data:
+            init_data_unsafe = data.get('initDataUnsafe', {})
+            if isinstance(init_data_unsafe, dict) and init_data_unsafe.get('user'):
+                user_data = init_data_unsafe['user']
+                telegram_id = user_data.get('id')
+            else:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Missing initData. Please open the mini app from Telegram."
+                    }
+                }), 401
+        else:
+            import urllib.parse
+            import json as json_lib
+            
+            if isinstance(init_data, dict):
+                parsed_data = init_data
+            else:
+                parsed_data = urllib.parse.parse_qs(init_data)
+            
+            user_str = parsed_data.get('user', [''])[0] if isinstance(parsed_data, dict) and 'user' in parsed_data else None
+            if not user_str and isinstance(parsed_data, dict):
+                user_str = parsed_data.get('user')
+            
+            if not user_str:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid initData format."
+                    }
+                }), 401
+            
+            try:
+                if isinstance(user_str, str):
+                    user_data = json_lib.loads(urllib.parse.unquote(user_str))
+                else:
+                    user_data = user_str
+                telegram_id = user_data.get('id')
+            except (json_lib.JSONDecodeError, KeyError, TypeError):
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid user data in initData."
+                    }
+                }), 401
+        
+        if not telegram_id:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Telegram ID not found in initData."
+                }
+            }), 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered. Please register in the bot first."
+                }
+            }), 404
+        
+        # Получаем промокод
+        promo_code_str = data.get('promo_code') or data.get('promoCode', '').strip().upper()
+        if not promo_code_str:
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Request",
+                    "message": "promo_code is required"
+                }
+            }), 400
+        
+        # Активируем промокод (используем логику из activate_promocode)
+        promo = PromoCode.query.filter_by(code=promo_code_str).first()
+        if not promo:
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Promo Code",
+                    "message": "Неверный промокод"
+                }
+            }), 400
+        
+        if promo.uses_left <= 0:
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Promo Code",
+                    "message": "Промокод больше не действителен"
+                }
+            }), 400
+        
+        if promo.promo_type == 'DAYS':
+            # Применяем бесплатные дни
+            h, c = get_remnawave_headers()
+            live = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+            curr_exp = parse_iso_datetime(live.get('expireAt'))
+            new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=promo.value)
+            
+            patch_resp = requests.patch(
+                f"{API_URL}/api/users",
+                headers={"Content-Type": "application/json", **h},
+                json={"uuid": user.remnawave_uuid, "expireAt": new_exp.isoformat()},
+                timeout=10
+            )
+            
+            if not patch_resp.ok:
+                return jsonify({
+                    "detail": {
+                        "title": "Internal Server Error",
+                        "message": "Failed to activate promo code"
+                    }
+                }), 500
+            
+            # Списываем использование промокода
+            promo.uses_left -= 1
+            db.session.commit()
+            
+            cache.delete(f'live_data_{user.remnawave_uuid}')
+            cache.delete('all_live_users_map')
+            
+            response = jsonify({
+                "success": True,
+                "message": f"Промокод активирован! Вы получили {promo.value} бесплатных дней."
+            })
+        elif promo.promo_type == 'PERCENT':
+            # Процентные промокоды применяются при создании платежа
+            response = jsonify({
+                "success": True,
+                "message": f"Промокод действителен! Скидка {promo.value}% будет применена при оплате."
+            })
+        else:
+            return jsonify({
+                "detail": {
+                    "title": "Invalid Promo Code",
+                    "message": "Неизвестный тип промокода"
+                }
+            }), 400
+        
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+        
+    except Exception as e:
+        print(f"Error in miniapp_activate_promocode: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "detail": {
+                "title": "Internal Server Error",
+                "message": "An error occurred while processing the request."
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+@app.route('/miniapp/promo-offers/<offer_id>/claim', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def miniapp_claim_promo_offer(offer_id):
+    """Активировать промо-оффер через miniapp (алиас для промокода)"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    # Перенаправляем на активацию промокода
+    # offer_id может быть кодом промокода
+    try:
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            data = dict(request.form)
+        elif request.data:
+            try:
+                import json as json_lib
+                data = json_lib.loads(request.data.decode('utf-8'))
+            except:
+                pass
+        
+        # Используем offer_id как код промокода
+        data['promo_code'] = offer_id
+        request.json = data
+        
+        # Вызываем функцию активации промокода
+        return miniapp_activate_promocode()
+        
+    except Exception as e:
+        print(f"Error in miniapp_claim_promo_offer: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "detail": {
+                "title": "Internal Server Error",
+                "message": "An error occurred while processing the request."
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+@app.route('/miniapp/nodes', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_nodes():
+    """Получить список серверов для miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        data = request.json or {}
+        init_data = data.get('initData') or data.get('init_data') or data.get('data') or ''
+        
+        if not init_data:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Missing initData"
+                }
+            }), 401
+        
+        # Парсим initData (используем ту же логику, что и в miniapp_subscription)
+        import urllib.parse
+        parsed_data = urllib.parse.parse_qs(init_data)
+        user_str = parsed_data.get('user', [''])[0]
+        
+        if not user_str:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Invalid initData format"
+                }
+            }), 401
+        
+        import json as json_lib
+        user_data = json_lib.loads(user_str)
+        telegram_id = user_data.get('id')
+        
+        if not telegram_id:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "User ID not found in initData"
+                }
+            }), 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered"
+                }
+            }), 404
+        
+        # Получаем серверы
+        headers, cookies = get_remnawave_headers()
+        resp = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}/accessible-nodes", headers=headers, cookies=cookies, timeout=10)
+        
+        if resp.status_code == 200:
+            nodes_data = resp.json()
+            response = jsonify(nodes_data)
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 200
+        else:
+            return jsonify({
+                "detail": {
+                    "title": "Error",
+                    "message": "Failed to fetch nodes"
+                }
+            }), 500
+            
+    except Exception as e:
+        print(f"Error in miniapp_nodes: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "detail": {
+                "title": "Internal Server Error",
+                "message": str(e)
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+@app.route('/miniapp/tariffs', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_tariffs():
+    """Получить список тарифов для miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        tariffs = Tariff.query.all()
+        tariffs_list = [{
+            "id": t.id, 
+            "name": t.name, 
+            "duration_days": t.duration_days, 
+            "price_uah": t.price_uah, 
+            "price_rub": t.price_rub, 
+            "price_usd": t.price_usd,
+            "squad_id": t.squad_id,
+            "traffic_limit_bytes": t.traffic_limit_bytes or 0,
+            "tier": t.tier,
+            "badge": t.badge
+        } for t in tariffs]
+        
+        response = jsonify({"tariffs": tariffs_list})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+    except Exception as e:
+        print(f"Error in miniapp_tariffs: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({"tariffs": []})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+@app.route('/miniapp/subscription/renewal/options', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_subscription_renewal_options():
+    """Получить опции продления подписки для miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        # Парсим initData для получения пользователя
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            data = dict(request.form)
+        elif request.data:
+            try:
+                import json as json_lib
+                data = json_lib.loads(request.data.decode('utf-8'))
+            except:
+                pass
+        
+        init_data = data.get('initData') or request.headers.get('X-Telegram-Init-Data') or request.headers.get('X-Init-Data') or request.args.get('initData')
+        
+        if not init_data:
+            init_data_unsafe = data.get('initDataUnsafe', {})
+            if isinstance(init_data_unsafe, dict) and init_data_unsafe.get('user'):
+                user_data = init_data_unsafe['user']
+                telegram_id = user_data.get('id')
+            else:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Missing initData. Please open the mini app from Telegram."
+                    }
+                }), 401
+        else:
+            import urllib.parse
+            import json as json_lib
+            
+            if isinstance(init_data, dict):
+                parsed_data = init_data
+            else:
+                parsed_data = urllib.parse.parse_qs(init_data)
+            
+            user_str = parsed_data.get('user', [''])[0] if isinstance(parsed_data, dict) and 'user' in parsed_data else None
+            if not user_str and isinstance(parsed_data, dict):
+                user_str = parsed_data.get('user')
+            
+            if not user_str:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid initData format."
+                    }
+                }), 401
+            
+            try:
+                if isinstance(user_str, str):
+                    user_data = json_lib.loads(urllib.parse.unquote(user_str))
+                else:
+                    user_data = user_str
+                telegram_id = user_data.get('id')
+            except (json_lib.JSONDecodeError, KeyError, TypeError):
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid user data in initData."
+                    }
+                }), 401
+        
+        if not telegram_id:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Telegram ID not found in initData."
+                }
+            }), 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered. Please register in the bot first."
+                }
+            }), 404
+        
+        # Получаем данные подписки
+        h, c = get_remnawave_headers()
+        live = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+        
+        # Получаем тарифы для продления
+        tariffs = Tariff.query.all()
+        
+        # Определяем валюту пользователя
+        currency = user.preferred_currency.upper() if user.preferred_currency else 'UAH'
+        currency_map = {'UAH': 'UAH', 'RUB': 'RUB', 'USD': 'USD'}
+        currency = currency_map.get(currency, 'UAH')
+        
+        # Формируем опции продления
+        periods = []
+        for t in tariffs:
+            price_map = {"uah": t.price_uah, "rub": t.price_rub, "usd": t.price_usd}
+            price = price_map.get(currency.lower(), t.price_uah)
+            
+            periods.append({
+                "id": t.id,
+                "duration_days": t.duration_days,
+                "price": price,
+                "currency": currency,
+                "name": t.name
+            })
+        
+        # Получаем баланс пользователя (если есть)
+        balance = 0.0  # Можно добавить поле balance в модель User
+        
+        response_data = {
+            "renewal": {
+                "periods": periods,
+                "currency": currency,
+                "balance": balance,
+                "balance_kopeks": int(balance * 100) if currency == 'RUB' else int(balance * 100),
+                "subscription_id": user.id  # Используем user.id как subscription_id
+            }
+        }
+        
+        response = jsonify(response_data)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+        
+    except Exception as e:
+        print(f"Error in miniapp_subscription_renewal_options: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "detail": {
+                "title": "Internal Server Error",
+                "message": "An error occurred while processing the request."
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+@app.route('/miniapp/subscription/settings', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_subscription_settings():
+    """Получить настройки подписки для miniapp"""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    try:
+        # Парсим initData для получения пользователя
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            data = dict(request.form)
+        elif request.data:
+            try:
+                import json as json_lib
+                data = json_lib.loads(request.data.decode('utf-8'))
+            except:
+                pass
+        
+        init_data = data.get('initData') or request.headers.get('X-Telegram-Init-Data') or request.headers.get('X-Init-Data') or request.args.get('initData')
+        
+        if not init_data:
+            init_data_unsafe = data.get('initDataUnsafe', {})
+            if isinstance(init_data_unsafe, dict) and init_data_unsafe.get('user'):
+                user_data = init_data_unsafe['user']
+                telegram_id = user_data.get('id')
+            else:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Missing initData. Please open the mini app from Telegram."
+                    }
+                }), 401
+        else:
+            import urllib.parse
+            import json as json_lib
+            
+            if isinstance(init_data, dict):
+                parsed_data = init_data
+            else:
+                parsed_data = urllib.parse.parse_qs(init_data)
+            
+            user_str = parsed_data.get('user', [''])[0] if isinstance(parsed_data, dict) and 'user' in parsed_data else None
+            if not user_str and isinstance(parsed_data, dict):
+                user_str = parsed_data.get('user')
+            
+            if not user_str:
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid initData format."
+                    }
+                }), 401
+            
+            try:
+                if isinstance(user_str, str):
+                    user_data = json_lib.loads(urllib.parse.unquote(user_str))
+                else:
+                    user_data = user_str
+                telegram_id = user_data.get('id')
+            except (json_lib.JSONDecodeError, KeyError, TypeError):
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Invalid user data in initData."
+                    }
+                }), 401
+        
+        if not telegram_id:
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Telegram ID not found in initData."
+                }
+            }), 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered. Please register in the bot first."
+                }
+            }), 404
+        
+        # Получаем данные подписки
+        h, c = get_remnawave_headers()
+        live = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+        
+        # Получаем доступные серверы (ноды)
+        nodes_resp = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}/accessible-nodes", headers=h)
+        nodes_data = []
+        if nodes_resp.status_code == 200:
+            nodes_json = nodes_resp.json()
+            if isinstance(nodes_json, dict) and 'response' in nodes_json:
+                nodes_list = nodes_json.get('response', [])
+            elif isinstance(nodes_json, list):
+                nodes_list = nodes_json
+            else:
+                nodes_list = []
+            
+            for node in nodes_list:
+                if isinstance(node, dict):
+                    nodes_data.append({
+                        "uuid": node.get('uuid'),
+                        "name": node.get('name') or node.get('location') or 'Unknown',
+                        "country": node.get('country') or node.get('location') or 'Unknown',
+                        "is_online": node.get('isOnline') or node.get('is_online') or False
+                    })
+        
+        # Получаем текущие подключенные серверы
+        current_servers = live.get('activeInternalSquads', []) or []
+        
+        # Получаем информацию о трафике
+        traffic_limit_bytes = live.get('trafficLimitBytes') or 0
+        used_traffic_bytes = live.get('usedTrafficBytes') or live.get('lifetimeUsedTrafficBytes') or 0
+        
+        # Получаем информацию об устройствах
+        hwid_device_limit = live.get('hwidDeviceLimit') or 0
+        
+        # Формируем ответ
+        response_data = {
+            "settings": {
+                "current": {
+                    "servers": current_servers,
+                    "connected_servers": current_servers
+                },
+                "servers": {
+                    "available": nodes_data,
+                    "countries": nodes_data
+                },
+                "traffic": {
+                    "limit_bytes": traffic_limit_bytes,
+                    "used_bytes": used_traffic_bytes,
+                    "limit_gb": round(traffic_limit_bytes / (1024 ** 3), 2) if traffic_limit_bytes > 0 else 0,
+                    "used_gb": round(used_traffic_bytes / (1024 ** 3), 2),
+                    "unlimited": traffic_limit_bytes == 0
+                },
+                "devices": {
+                    "limit": hwid_device_limit,
+                    "current": 0  # Можно добавить отслеживание текущих устройств
+                }
+            }
+        }
+        
+        response = jsonify(response_data)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
+        
+    except Exception as e:
+        print(f"Error in miniapp_subscription_settings: {e}")
+        import traceback
+        traceback.print_exc()
+        response = jsonify({
+            "detail": {
+                "title": "Internal Server Error",
+                "message": "An error occurred while processing the request."
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
 
 @app.route('/api/client/nodes', methods=['GET'])
 def get_client_nodes():
@@ -1263,7 +3762,8 @@ def get_client_nodes():
             return jsonify(cached), 200
     
     try:
-        resp = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}/accessible-nodes", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
+        headers, cookies = get_remnawave_headers()
+        resp = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}/accessible-nodes", headers=headers, cookies=cookies)
         resp.raise_for_status()
         data = resp.json()
         cache.set(f'nodes_{user.remnawave_uuid}', data, timeout=600)
@@ -1279,7 +3779,8 @@ def get_all_users(current_admin):
         local_users = User.query.all()
         live_map = cache.get('all_live_users_map')
         if not live_map:
-            resp = requests.get(f"{API_URL}/api/users", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
+            headers, cookies = get_remnawave_headers()
+            resp = requests.get(f"{API_URL}/api/users", headers=headers, cookies=cookies)
             data = resp.json().get('response', {})
             # Безопасный парсинг
             users_list = data.get('users', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
@@ -1422,7 +3923,8 @@ def delete_user(current_admin, user_id):
         if not u: return jsonify({"message": "Not found"}), 404
         if u.id == current_admin.id: return jsonify({"message": "Cannot delete self"}), 400
         try:
-            requests.delete(f"{API_URL}/api/users/{u.remnawave_uuid}", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
+            headers, cookies = get_remnawave_headers()
+            requests.delete(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=headers, cookies=cookies)
         except: pass
         cache.delete('all_live_users_map')
         db.session.delete(u); db.session.commit()
@@ -1996,6 +4498,58 @@ def get_public_tariffs():
         "badge": t.badge
     } for t in Tariff.query.all()]), 200
 
+@app.route('/api/public/nodes', methods=['GET'])
+@cache.cached(timeout=300)  # Кэш на 5 минут
+def get_public_nodes():
+    """Публичный endpoint для получения списка серверов (для лендинга)"""
+    try:
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        resp = requests.get(f"{API_URL}/api/nodes", headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        data = resp.json()
+        
+        # Обрабатываем ответ согласно структуре API
+        if isinstance(data, dict) and 'response' in data:
+            nodes_list = data['response']
+            if isinstance(nodes_list, dict) and 'nodes' in nodes_list:
+                nodes_list = nodes_list['nodes']
+            elif not isinstance(nodes_list, list):
+                nodes_list = []
+        elif isinstance(data, list):
+            nodes_list = data
+        else:
+            nodes_list = []
+        
+        # Фильтруем только активные серверы и возвращаем только нужные поля
+        public_nodes = []
+        for node in nodes_list:
+            if isinstance(node, dict):
+                # Проверяем, активен ли сервер
+                is_active = (
+                    node.get('isOnline') or 
+                    node.get('is_online') or 
+                    node.get('status') == 'online' or
+                    node.get('state') == 'active'
+                )
+                
+                if is_active:
+                    public_nodes.append({
+                        "uuid": node.get('uuid'),
+                        "name": node.get('name') or node.get('location') or 'Unknown',
+                        "location": node.get('location') or node.get('name') or 'Unknown',
+                        "regionName": node.get('regionName') or node.get('region') or node.get('countryCode'),
+                        "countryCode": node.get('countryCode') or node.get('country'),
+                        "isOnline": True
+                    })
+        
+        return jsonify(public_nodes), 200
+    except Exception as e:
+        print(f"Error in get_public_nodes: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Failed to fetch nodes", "nodes": []}), 500
+
 @app.route('/api/client/settings', methods=['POST'])
 def set_settings():
     user = get_user_from_token()
@@ -2004,6 +4558,8 @@ def set_settings():
     if 'lang' in d: user.preferred_lang = d['lang']
     if 'currency' in d: user.preferred_currency = d['currency']
     db.session.commit()
+    # Очищаем кэш пользователя, чтобы новые настройки сразу отобразились
+    cache.delete(f'live_data_{user.remnawave_uuid}')
     return jsonify({"message": "OK"}), 200
 
 # --- SYSTEM SETTINGS (Default Language & Currency) ---
@@ -2011,25 +4567,34 @@ def set_settings():
 @admin_required
 def system_settings(current_admin):
     s = SystemSetting.query.first() or SystemSetting(id=1)
-    if not s.id: db.session.add(s); db.session.commit()
+    if not s.id: 
+        db.session.add(s)
+        db.session.commit()
+        # Устанавливаем значение по умолчанию для нового поля
+        if s.show_language_currency_switcher is None:
+            s.show_language_currency_switcher = True
+            db.session.commit()
     
     if request.method == 'GET':
         return jsonify({
             "default_language": s.default_language,
-            "default_currency": s.default_currency
+            "default_currency": s.default_currency,
+            "show_language_currency_switcher": s.show_language_currency_switcher if s.show_language_currency_switcher is not None else True
         }), 200
     
     # POST - обновление
     try:
         data = request.json
         if 'default_language' in data:
-            if data['default_language'] not in ['ru', 'ua', 'cn']:
+            if data['default_language'] not in ['ru', 'ua', 'cn', 'en']:
                 return jsonify({"message": "Invalid language"}), 400
             s.default_language = data['default_language']
         if 'default_currency' in data:
             if data['default_currency'] not in ['uah', 'rub', 'usd']:
                 return jsonify({"message": "Invalid currency"}), 400
             s.default_currency = data['default_currency']
+        if 'show_language_currency_switcher' in data:
+            s.show_language_currency_switcher = bool(data['show_language_currency_switcher'])
         db.session.commit()
         return jsonify({"message": "Updated"}), 200
     except Exception as e:
@@ -2111,6 +4676,21 @@ def public_branding():
         "dashboard_tagline": b.dashboard_tagline or ""
     }), 200
 
+@app.route('/api/public/system-settings', methods=['GET'])
+def public_system_settings():
+    """Публичный эндпоинт для получения публичных системных настроек"""
+    s = SystemSetting.query.first() or SystemSetting(id=1)
+    if not s.id: 
+        db.session.add(s)
+        db.session.commit()
+        if s.show_language_currency_switcher is None:
+            s.show_language_currency_switcher = True
+            db.session.commit()
+    
+    return jsonify({
+        "show_language_currency_switcher": s.show_language_currency_switcher if s.show_language_currency_switcher is not None else True
+    }), 200
+
 # --- PAYMENT & SUPPORT ---
 
 @app.route('/api/public/available-payment-methods', methods=['GET'])
@@ -2167,6 +4747,11 @@ def available_payment_methods():
     if telegram_token and telegram_token != "DECRYPTION_ERROR":
         available.append('telegram_stars')
     
+    # Monobank - нужен token
+    monobank_token = decrypt_key(s.monobank_token) if s.monobank_token else None
+    if monobank_token and monobank_token != "DECRYPTION_ERROR":
+        available.append('monobank')
+    
     return jsonify({"available_methods": available}), 200
 
 @app.route('/api/admin/payment-settings', methods=['GET', 'POST'])
@@ -2190,6 +4775,7 @@ def pay_settings(current_admin):
         s.urlpay_api_key = encrypt_key(d.get('urlpay_api_key', ''))
         s.urlpay_secret_key = encrypt_key(d.get('urlpay_secret_key', ''))
         s.urlpay_shop_id = encrypt_key(d.get('urlpay_shop_id', ''))
+        s.monobank_token = encrypt_key(d.get('monobank_token', ''))
         db.session.commit()
     return jsonify({
         "crystalpay_api_key": decrypt_key(s.crystalpay_api_key), 
@@ -2205,7 +4791,8 @@ def pay_settings(current_admin):
         "mulenpay_shop_id": decrypt_key(s.mulenpay_shop_id),
         "urlpay_api_key": decrypt_key(s.urlpay_api_key),
         "urlpay_secret_key": decrypt_key(s.urlpay_secret_key),
-        "urlpay_shop_id": decrypt_key(s.urlpay_shop_id)
+        "urlpay_shop_id": decrypt_key(s.urlpay_shop_id),
+        "monobank_token": decrypt_key(s.monobank_token)
     }), 200
 
 @app.route('/api/client/create-payment', methods=['POST'])
@@ -2447,27 +5034,29 @@ def create_payment():
             # Генерируем UUID для транзакции
             transaction_uuid = str(uuid.uuid4())
             
-            # Формируем payload для создания платежа
-            # Сначала нужно получить доступные методы оплаты, но для простоты используем paymentMethod = 1
-            # В реальности нужно получить список методов через GET /api/platega.io/transaction/payment_methods
+            # Формируем payload согласно документации Platega API
             payload = {
-                "merchantId": merchant_id,
-                "paymentMethod": 1,  # По умолчанию используем метод 1, можно сделать получение списка методов
+                "paymentMethod": 2,  # 2 - СБП/QR, 10 - CardRu, 12 - International
+                "id": transaction_uuid,
                 "paymentDetails": {
-                    "amount": final_amount,
+                    "amount": int(final_amount),
                     "currency": info['c']
                 },
-                "id": transaction_uuid
+                "description": f"Payment for order {transaction_uuid}",
+                "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/dashboard/subscription",
+                "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/dashboard/subscription"
             }
             
+            # Заголовки согласно документации Platega API
             headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "X-MerchantId": merchant_id,
+                "X-Secret": api_key
             }
             
             try:
                 resp = requests.post(
-                    "https://api.platega.io/transaction/process",
+                    "https://app.platega.io/transaction/process",
                     json=payload,
                     headers=headers,
                     timeout=30
@@ -2483,6 +5072,19 @@ def create_payment():
                     print(f"Platega Error: {error_msg}")
                     return jsonify({"message": error_msg}), 500
                     
+            except requests.exceptions.ConnectionError as e:
+                # Обработка DNS ошибок и проблем с подключением
+                error_msg = str(e)
+                if "Name or service not known" in error_msg or "Failed to resolve" in error_msg:
+                    print(f"Platega API DNS Error: {e}")
+                    return jsonify({
+                        "message": "Platega API недоступен. Проверьте настройки DNS или свяжитесь с поддержкой."
+                    }), 503  # Service Unavailable
+                else:
+                    print(f"Platega API Connection Error: {e}")
+                    return jsonify({
+                        "message": "Не удалось подключиться к Platega API. Проверьте интернет-соединение."
+                    }), 503
             except requests.exceptions.RequestException as e:
                 print(f"Platega API Error: {e}")
                 if hasattr(e, 'response') and e.response is not None:
@@ -2570,6 +5172,85 @@ def create_payment():
                 else:
                     error_msg = str(e)
                 return jsonify({"message": f"Mulenpay API Error: {error_msg}"}), 500
+        
+        elif payment_provider == 'monobank':
+            # Monobank API
+            monobank_token = decrypt_key(s.monobank_token) if s else None
+            if not monobank_token or monobank_token == "DECRYPTION_ERROR":
+                return jsonify({"message": "Monobank token not configured"}), 500
+            
+            # Monobank принимает сумму в копейках (минимальных единицах)
+            amount_in_kopecks = int(final_amount * 100)
+            if info['c'] == 'UAH':
+                amount_in_kopecks = int(final_amount * 100)  # UAH в копейках
+            elif info['c'] == 'RUB':
+                amount_in_kopecks = int(final_amount * 100)  # RUB в копейках
+            elif info['c'] == 'USD':
+                amount_in_kopecks = int(final_amount * 100)  # USD в центах
+            
+            # Код валюты по ISO 4217: 980 = UAH, 643 = RUB, 840 = USD
+            currency_code = 980  # По умолчанию UAH
+            if info['c'] == 'RUB':
+                currency_code = 643
+            elif info['c'] == 'USD':
+                currency_code = 840
+            
+            # Создаем инвойс через Monobank API
+            payload = {
+                "amount": amount_in_kopecks,
+                "ccy": currency_code,
+                "merchantPaymInfo": {
+                    "reference": order_id,
+                    "destination": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                    "basketOrder": [
+                        {
+                            "name": f"Подписка {t.name}",
+                            "qty": 1,
+                            "sum": amount_in_kopecks,
+                            "unit": "шт"
+                        }
+                    ]
+                },
+                "redirectUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                "webHookUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/monobank",
+                "validity": 86400,  # 24 часа в секундах
+                "paymentType": "debit"
+            }
+            
+            headers = {
+                "X-Token": monobank_token,
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.monobank.ua/api/merchant/invoice/create",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                payment_url = payment_data.get('pageUrl')
+                payment_system_id = payment_data.get('invoiceId') or order_id
+                
+                if not payment_url:
+                    error_msg = payment_data.get('errText') or 'Failed to get payment URL from Monobank'
+                    print(f"Monobank Error: {error_msg}")
+                    return jsonify({"message": error_msg}), 500
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"Monobank API Error: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('errText') or error_data.get('message') or str(e)
+                    except:
+                        error_msg = str(e)
+                else:
+                    error_msg = str(e)
+                return jsonify({"message": f"Monobank API Error: {error_msg}"}), 500
         
         elif payment_provider == 'urlpay':
             # UrlPay API (аналогично Mulenpay)
@@ -2667,9 +5348,9 @@ def create_payment():
             
             payment_url = resp.get('url')
             payment_system_id = resp.get('id')
-        
-        if not payment_url:
-            return jsonify({"message": "Failed to create payment"}), 500
+            
+            if not payment_url:
+                return jsonify({"message": "Failed to create payment"}), 500
         
         new_p = Payment(
             order_id=order_id, 
@@ -2698,8 +5379,8 @@ def crystal_webhook():
     u = db.session.get(User, p.user_id)
     t = db.session.get(Tariff, p.tariff_id)
     
-    h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
-    live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
+    h, c = get_remnawave_headers()
+    live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
     curr_exp = parse_iso_datetime(live.get('expireAt'))
     new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
     
@@ -2718,7 +5399,8 @@ def crystal_webhook():
         patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
         patch_payload["trafficLimitStrategy"] = "NO_RESET"
     
-    patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+    h, c = get_remnawave_headers({"Content-Type": "application/json"})
+    patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
     if not patch_resp.ok:
         print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
         return jsonify({"error": False}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
@@ -2772,8 +5454,8 @@ def heleket_webhook():
     u = db.session.get(User, p.user_id)
     t = db.session.get(Tariff, p.tariff_id)
     
-    h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
-    live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
+    h, c = get_remnawave_headers()
+    live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
     curr_exp = parse_iso_datetime(live.get('expireAt'))
     new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
     
@@ -2792,7 +5474,8 @@ def heleket_webhook():
         patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
         patch_payload["trafficLimitStrategy"] = "NO_RESET"
     
-    patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+    h, c = get_remnawave_headers({"Content-Type": "application/json"})
+    patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
     if not patch_resp.ok:
         print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
         return jsonify({"error": False}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
@@ -2996,7 +5679,8 @@ def yookassa_webhook():
                 patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
                 patch_payload["trafficLimitStrategy"] = "NO_RESET"
             
-            patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+            h, c = get_remnawave_headers({"Content-Type": "application/json"})
+            patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
             if not patch_resp.ok:
                 print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
                 return jsonify({"error": False}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
@@ -3132,7 +5816,8 @@ def telegram_webhook():
                     patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
                     patch_payload["trafficLimitStrategy"] = "NO_RESET"
                 
-                patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+                h, c = get_remnawave_headers({"Content-Type": "application/json"})
+                patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
                 if not patch_resp.ok:
                     print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
                     return jsonify({"ok": True}), 200  # Все равно возвращаем успех
@@ -3226,7 +5911,8 @@ def platega_webhook():
             patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
             patch_payload["trafficLimitStrategy"] = "NO_RESET"
         
-        patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
         if not patch_resp.ok:
             print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
             return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
@@ -3320,7 +6006,8 @@ def mulenpay_webhook():
             patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
             patch_payload["trafficLimitStrategy"] = "NO_RESET"
         
-        patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
         if not patch_resp.ok:
             print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
             return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
@@ -3414,7 +6101,8 @@ def urlpay_webhook():
             patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
             patch_payload["trafficLimitStrategy"] = "NO_RESET"
         
-        patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
         if not patch_resp.ok:
             print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
             return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
@@ -3449,6 +6137,102 @@ def urlpay_webhook():
         import traceback
         traceback.print_exc()
         return jsonify({}), 200  # Всегда возвращаем 200, чтобы UrlPay не повторял запрос
+
+@app.route('/api/webhook/monobank', methods=['POST'])
+def monobank_webhook():
+    """Webhook для обработки уведомлений от Monobank"""
+    try:
+        webhook_data = request.json
+        if not webhook_data:
+            return jsonify({}), 200
+        
+        # Monobank отправляет данные о статусе инвойса
+        invoice_id = webhook_data.get('invoiceId')
+        status = webhook_data.get('status')
+        
+        if not invoice_id:
+            print("Monobank webhook: invoiceId not found")
+            return jsonify({}), 200
+        
+        # Ищем платеж по invoiceId (payment_system_id) или order_id
+        p = Payment.query.filter_by(payment_system_id=invoice_id).first()
+        if not p:
+            # Пробуем найти по order_id, если invoiceId совпадает с order_id
+            p = Payment.query.filter_by(order_id=invoice_id).first()
+        
+        if not p:
+            print(f"Monobank webhook: Payment not found for invoiceId {invoice_id}")
+            return jsonify({}), 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return jsonify({}), 200
+        
+        # Обрабатываем только успешные платежи (status = 'success' или 'paid')
+        if status in ['success', 'paid', 'successful']:
+            u = db.session.get(User, p.user_id)
+            t = db.session.get(Tariff, p.tariff_id)
+            
+            if not u or not t:
+                print(f"Monobank webhook: User or Tariff not found for payment {p.order_id}")
+                return jsonify({}), 200
+            
+            h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+            live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
+            curr_exp = datetime.fromisoformat(live.get('expireAt'))
+            new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+            
+            # Используем сквад из тарифа, если указан, иначе дефолтный
+            squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+            
+            # Формируем payload для обновления пользователя
+            patch_payload = {
+                "uuid": u.remnawave_uuid,
+                "expireAt": new_exp.isoformat(),
+                "activeInternalSquads": [squad_id]
+            }
+            
+            # Добавляем лимит трафика, если указан в тарифе
+            if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+                patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+                patch_payload["trafficLimitStrategy"] = "NO_RESET"
+            
+            h, c = get_remnawave_headers({"Content-Type": "application/json"})
+            patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
+            if not patch_resp.ok:
+                print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+                return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
+            
+            # Списываем использование промокода, если он был использован
+            if p.promo_code_id:
+                promo = db.session.get(PromoCode, p.promo_code_id)
+                if promo and promo.uses_left > 0:
+                    promo.uses_left -= 1
+            
+            p.status = 'PAID'
+            db.session.commit()
+            cache.delete(f'live_data_{u.remnawave_uuid}')
+            cache.delete(f'nodes_{u.remnawave_uuid}')
+            
+            # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+            if BOT_API_URL and BOT_API_TOKEN:
+                app_context = app.app_context()
+                import threading
+                sync_thread = threading.Thread(
+                    target=sync_subscription_to_bot_in_background,
+                    args=(app_context, u.remnawave_uuid),
+                    daemon=True
+                )
+                sync_thread.start()
+                print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        return jsonify({}), 200
+        
+    except Exception as e:
+        print(f"Monobank webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({}), 200  # Всегда возвращаем 200, чтобы Monobank не повторял запрос
 
 @app.route('/api/client/support-tickets', methods=['GET', 'POST'])
 def client_tickets():
@@ -3814,6 +6598,8 @@ def bot_register():
     telegram_id = data.get('telegram_id')
     telegram_username = data.get('telegram_username', '')
     ref_code = data.get('ref_code')
+    preferred_lang = data.get('preferred_lang')
+    preferred_currency = data.get('preferred_currency')
     
     if not telegram_id:
         return jsonify({"message": "telegram_id is required"}), 400
@@ -3893,6 +6679,10 @@ def bot_register():
             db.session.add(sys_settings)
             db.session.flush()
         
+        # Используем переданные язык и валюту, или значения по умолчанию из настроек
+        final_lang = preferred_lang if preferred_lang in ['ru', 'ua', 'en', 'cn'] else sys_settings.default_language
+        final_currency = preferred_currency if preferred_currency in ['uah', 'rub', 'usd'] else sys_settings.default_currency
+        
         # Шифруем пароль для хранения (чтобы можно было показать пользователю)
         encrypted_password_str = None
         if app.config.get('FERNET_KEY') and fernet:
@@ -3912,8 +6702,8 @@ def bot_register():
             referrer_id=referrer.id if referrer else None,
             is_verified=True,  # Telegram пользователи считаются верифицированными
             created_at=datetime.now(timezone.utc),
-            preferred_lang=sys_settings.default_language,
-            preferred_currency=sys_settings.default_currency
+            preferred_lang=final_lang,
+            preferred_currency=final_currency
         )
         db.session.add(new_user)
         db.session.flush()
@@ -4115,7 +6905,8 @@ def init_database():
                     mulenpay_shop_id TEXT,
                     urlpay_api_key TEXT,
                     urlpay_secret_key TEXT,
-                    urlpay_shop_id TEXT
+                    urlpay_shop_id TEXT,
+                    monobank_token TEXT
                 )
             """)
             conn.commit()
@@ -4130,17 +6921,44 @@ def init_database():
             # Список всех необходимых колонок
             required_columns = ['platega_api_key', 'platega_merchant_id', 'mulenpay_api_key', 
                                'mulenpay_secret_key', 'mulenpay_shop_id', 'urlpay_api_key', 
-                               'urlpay_secret_key', 'urlpay_shop_id']
+                               'urlpay_secret_key', 'urlpay_shop_id', 'monobank_token']
             
             # Проверяем, какие колонки отсутствуют
             missing_columns = [col for col in required_columns if col not in existing_columns]
             
-            # Если есть недостающие колонки, используем raw SQL для работы с таблицей
-            # (чтобы избежать ошибок ORM из-за несоответствия схемы)
+            # Если есть недостающие колонки, добавляем их автоматически
             if missing_columns:
                 payment_migration_performed = True
                 print(f"⚠️  В таблице payment_setting отсутствуют {len(missing_columns)} колонок")
-                print("   Для добавления колонок запустите: python3 migrate_payment_systems.py")
+                print("   Добавляем недостающие колонки автоматически...")
+                
+                # Маппинг колонок и их типов
+                column_types = {
+                    'platega_api_key': 'TEXT',
+                    'platega_merchant_id': 'TEXT',
+                    'mulenpay_api_key': 'TEXT',
+                    'mulenpay_secret_key': 'TEXT',
+                    'mulenpay_shop_id': 'TEXT',
+                    'urlpay_api_key': 'TEXT',
+                    'urlpay_secret_key': 'TEXT',
+                    'urlpay_shop_id': 'TEXT',
+                    'monobank_token': 'TEXT'
+                }
+                
+                # Добавляем каждую недостающую колонку
+                for col_name in missing_columns:
+                    if col_name in column_types:
+                        try:
+                            cursor.execute(f"ALTER TABLE payment_setting ADD COLUMN {col_name} {column_types[col_name]}")
+                            print(f"✓ Колонка {col_name} добавлена")
+                        except sqlite3.OperationalError as e:
+                            if "duplicate column name" in str(e).lower():
+                                print(f"✓ Колонка {col_name} уже существует")
+                            else:
+                                print(f"⚠️  Ошибка при добавлении колонки {col_name}: {e}")
+                
+                conn.commit()
+                print("✓ Недостающие колонки добавлены")
             else:
                 payment_migration_performed = False
         
@@ -4151,11 +6969,35 @@ def init_database():
                 CREATE TABLE system_setting (
                     id INTEGER PRIMARY KEY,
                     default_language VARCHAR(10) NOT NULL DEFAULT 'ru',
-                    default_currency VARCHAR(10) NOT NULL DEFAULT 'uah'
+                    default_currency VARCHAR(10) NOT NULL DEFAULT 'uah',
+                    show_language_currency_switcher BOOLEAN DEFAULT 1 NOT NULL
                 )
             """)
             conn.commit()
-            print("✓ Таблица system_setting создана")
+            print("✓ Таблица system_setting создана (с колонкой show_language_currency_switcher)")
+        else:
+            # Таблица существует - проверяем наличие колонки show_language_currency_switcher
+            cursor.execute("PRAGMA table_info(system_setting)")
+            existing_columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'show_language_currency_switcher' not in existing_columns:
+                print("⚠️  Добавление колонки show_language_currency_switcher в system_setting...")
+                try:
+                    cursor.execute("""
+                        ALTER TABLE system_setting 
+                        ADD COLUMN show_language_currency_switcher BOOLEAN DEFAULT 1 NOT NULL
+                    """)
+                    # Устанавливаем значение по умолчанию для существующих записей
+                    cursor.execute("""
+                        UPDATE system_setting 
+                        SET show_language_currency_switcher = 1 
+                        WHERE show_language_currency_switcher IS NULL
+                    """)
+                    conn.commit()
+                    print("✓ Колонка show_language_currency_switcher добавлена")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при добавлении колонки: {e}")
+                    conn.rollback()
         
         conn.close()
     except Exception as e:
@@ -4204,7 +7046,8 @@ def init_database():
             system_setting = SystemSetting(
                 id=1,
                 default_language='ru',
-                default_currency='uah'
+                default_currency='uah',
+                show_language_currency_switcher=True
             )
             db.session.add(system_setting)
             db.session.commit()
@@ -4376,6 +7219,531 @@ def init_database():
         print("📝 Следующий шаг: создайте администратора командой:")
         print("   python3 -m flask --app app make-admin ВАШ_EMAIL")
         print()
+
+# Обработка POST запросов к корневому пути /miniapp/
+# Miniapp может отправлять POST запросы к /miniapp/ для получения данных подписки
+@app.route('/miniapp/', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_root_post():
+    """
+    Обработка POST запросов к корневому пути /miniapp/.
+    Обрабатывает запросы на получение данных подписки (аналогично /miniapp/subscription).
+    """
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+    
+    print(f"[MINIAPP] POST /miniapp/ received")
+    print(f"[MINIAPP] Content-Type: {request.content_type}")
+    print(f"[MINIAPP] Method: {request.method}")
+    print(f"[MINIAPP] Headers: {dict(request.headers)}")
+    print(f"[MINIAPP] Args: {dict(request.args)}")
+    
+    # Проверяем, может ли это быть запрос от формы или навигации
+    # Если это запрос с пустым телом и заголовками браузера, возможно это навигация
+    if not request.data and not request.form and not request.is_json:
+        # Проверяем, может ли это быть запрос на получение статических файлов
+        # (например, форма пытается отправить данные, но форма пустая)
+        if request.headers.get('Sec-Fetch-Dest') == 'document':
+            print(f"[MINIAPP] Possible navigation request detected. Serving index.html")
+            # Это может быть запрос на навигацию, отдаем index.html
+            import os
+            miniapp_dir = get_miniapp_path()
+            if miniapp_dir:
+                index_path = os.path.join(miniapp_dir, 'index.html')
+                if os.path.exists(index_path):
+                    return send_file(index_path, mimetype='text/html')
+            # Если index.html не найден, перенаправляем на GET
+            return redirect('/miniapp/', code=302)
+    
+    try:
+        # Пробуем получить данные из разных источников
+        data = {}
+        
+        # 0. Пробуем получить initData из заголовков (если miniapp отправляет его туда)
+        init_data_from_header = request.headers.get('X-Telegram-Init-Data') or request.headers.get('X-Init-Data') or ''
+        
+        # 1. Пробуем JSON
+        try:
+            if request.is_json:
+                data = request.json or {}
+                print(f"[MINIAPP] Data from JSON: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+        except Exception as e:
+            print(f"[MINIAPP] Error parsing JSON: {e}")
+        
+        # 2. Пробуем form-data
+        if not data and request.form:
+            data = dict(request.form)
+            print(f"[MINIAPP] Data from form: {list(data.keys())}")
+        
+        # 3. Пробуем raw data
+        if not data and request.data:
+            try:
+                import json as json_lib
+                raw_data = request.data.decode('utf-8')
+                print(f"[MINIAPP] Raw data preview: {raw_data[:200]}")
+                # Пробуем распарсить как JSON
+                if raw_data.strip().startswith('{') or raw_data.strip().startswith('['):
+                    data = json_lib.loads(raw_data)
+                    print(f"[MINIAPP] Data from raw JSON: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+                else:
+                    # Если не JSON, пробуем как URL-encoded
+                    import urllib.parse
+                    data = urllib.parse.parse_qs(raw_data)
+                    # Преобразуем списки в строки
+                    data = {k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in data.items()}
+                    print(f"[MINIAPP] Data from URL-encoded: {list(data.keys())}")
+            except Exception as e:
+                print(f"[MINIAPP] Error parsing raw data: {e}")
+        
+        # 4. Пробуем получить initData из URL параметров
+        init_data_from_args = request.args.get('initData') or request.args.get('init_data') or ''
+        
+        # Логируем входящие данные для отладки (без чувствительной информации)
+        print(f"[MINIAPP] Final data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+        print(f"[MINIAPP] initData from header: {bool(init_data_from_header)}")
+        print(f"[MINIAPP] initData from args: {bool(init_data_from_args)}")
+        
+        # Пробуем получить initData из разных возможных источников
+        init_data = (data.get('initData') or 
+                    data.get('init_data') or 
+                    data.get('data') or 
+                    init_data_from_header or 
+                    init_data_from_args or 
+                    '')
+        
+        # Пробуем также получить данные из initDataUnsafe (если miniapp отправляет их)
+        init_data_unsafe = data.get('initDataUnsafe') or data.get('init_data_unsafe') or {}
+        user_from_unsafe = None
+        if isinstance(init_data_unsafe, dict):
+            user_from_unsafe = init_data_unsafe.get('user')
+        elif isinstance(data, dict):
+            # Пробуем получить user напрямую из data
+            user_from_unsafe = data.get('user')
+        
+        # Если initData не строка, пробуем преобразовать
+        if not isinstance(init_data, str):
+            if isinstance(init_data, dict):
+                # Если initData уже объект, пробуем извлечь user напрямую
+                user_data = init_data.get('user') or init_data
+                if isinstance(user_data, dict) and 'id' in user_data:
+                    telegram_id = user_data.get('id')
+                    if telegram_id:
+                        # Пропускаем парсинг, используем данные напрямую
+                        user = User.query.filter_by(telegram_id=telegram_id).first()
+                        if not user:
+                            return jsonify({
+                                "detail": {
+                                    "title": "User Not Found",
+                                    "message": "User not registered. Please register in the bot first.",
+                                    "code": "user_not_found"
+                                }
+                            }), 404
+                        # Продолжаем обработку - получаем данные из RemnaWave
+                        current_uuid = user.remnawave_uuid
+                        cache_key = f'live_data_{current_uuid}'
+                        if cached := cache.get(cache_key):
+                            response_data = cached.copy()
+                            response_data.update({
+                                'referral_code': user.referral_code,
+                                'preferred_lang': user.preferred_lang,
+                                'preferred_currency': user.preferred_currency,
+                                'telegram_id': user.telegram_id,
+                                'telegram_username': user.telegram_username
+                            })
+                            return jsonify(response_data), 200
+                        
+                        # Получаем данные из RemnaWave API
+                        try:
+                            resp = requests.get(
+                                f"{API_URL}/api/users/{current_uuid}",
+                                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                                timeout=10
+                            )
+                            
+                            if resp.status_code != 200:
+                                if resp.status_code == 404:
+                                    return jsonify({
+                                        "detail": {
+                                            "title": "Subscription Not Found",
+                                            "message": "User not found in VPN system. Please contact support."
+                                        }
+                                    }), 404
+                                return jsonify({
+                                    "detail": {
+                                        "title": "Subscription Not Found",
+                                        "message": f"Failed to fetch subscription data: {resp.status_code}"
+                                    }
+                                }), 500
+                            
+                            response_data = resp.json()
+                            result_data = response_data.get('response', {}) if isinstance(response_data, dict) else response_data
+                            
+                            if isinstance(result_data, dict):
+                                result_data.update({
+                                    'referral_code': user.referral_code,
+                                    'preferred_lang': user.preferred_lang,
+                                    'preferred_currency': user.preferred_currency,
+                                    'telegram_id': user.telegram_id,
+                                    'telegram_username': user.telegram_username
+                                })
+                            
+                            cache.set(cache_key, result_data, timeout=300)
+                            return jsonify(result_data), 200
+                        except requests.RequestException as e:
+                            print(f"Request Error in miniapp_root_post: {e}")
+                            return jsonify({
+                                "detail": {
+                                    "title": "Subscription Not Found",
+                                    "message": f"Failed to connect to VPN system: {str(e)}"
+                                }
+                            }), 500
+                    else:
+                        return jsonify({
+                            "detail": {
+                                "title": "Authorization Error",
+                                "message": "Telegram ID not found in initData."
+                            }
+                        }), 401
+                else:
+                    return jsonify({
+                        "detail": {
+                            "title": "Authorization Error",
+                            "message": "Invalid initData format: user data not found."
+                        }
+                    }), 401
+            else:
+                init_data = str(init_data) if init_data else ''
+        
+        # Если initData пустой, но есть user из initDataUnsafe, пробуем использовать его
+        if not init_data and user_from_unsafe and isinstance(user_from_unsafe, dict) and 'id' in user_from_unsafe:
+            telegram_id = user_from_unsafe.get('id')
+            if telegram_id:
+                print(f"[MINIAPP] Using user data from initDataUnsafe: telegram_id={telegram_id}")
+                user = User.query.filter_by(telegram_id=telegram_id).first()
+                if not user:
+                    return jsonify({
+                        "detail": {
+                            "title": "User Not Found",
+                            "message": "User not registered. Please register in the bot first.",
+                            "code": "user_not_found"
+                        }
+                    }), 404
+                # Продолжаем обработку - получаем данные из RemnaWave
+                current_uuid = user.remnawave_uuid
+                cache_key = f'live_data_{current_uuid}'
+                if cached := cache.get(cache_key):
+                    response_data = cached.copy()
+                    response_data.update({
+                        'referral_code': user.referral_code,
+                        'preferred_lang': user.preferred_lang,
+                        'preferred_currency': user.preferred_currency,
+                        'telegram_id': user.telegram_id,
+                        'telegram_username': user.telegram_username
+                    })
+                    return jsonify(response_data), 200
+                
+                # Получаем данные из RemnaWave API
+                try:
+                    resp = requests.get(
+                        f"{API_URL}/api/users/{current_uuid}",
+                        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                        timeout=10
+                    )
+                    
+                    if resp.status_code != 200:
+                        if resp.status_code == 404:
+                            return jsonify({
+                                "detail": {
+                                    "title": "Subscription Not Found",
+                                    "message": "User not found in VPN system. Please contact support."
+                                }
+                            }), 404
+                        return jsonify({
+                            "detail": {
+                                "title": "Subscription Not Found",
+                                "message": f"Failed to fetch subscription data: {resp.status_code}"
+                            }
+                        }), 500
+                    
+                    response_data = resp.json()
+                    result_data = response_data.get('response', {}) if isinstance(response_data, dict) else response_data
+                    
+                    if isinstance(result_data, dict):
+                        result_data.update({
+                            'referral_code': user.referral_code,
+                            'preferred_lang': user.preferred_lang,
+                            'preferred_currency': user.preferred_currency,
+                            'telegram_id': user.telegram_id,
+                            'telegram_username': user.telegram_username
+                        })
+                    
+                    cache.set(cache_key, result_data, timeout=300)
+                    return jsonify(result_data), 200
+                except requests.RequestException as e:
+                    print(f"Request Error in miniapp_root_post: {e}")
+                    return jsonify({
+                        "detail": {
+                            "title": "Subscription Not Found",
+                            "message": f"Failed to connect to VPN system: {str(e)}"
+                        }
+                    }), 500
+        
+        if not init_data:
+            # Если initData отсутствует, возможно miniapp открыт не из Telegram
+            # Логируем подробную информацию для отладки
+            print(f"[MINIAPP] No initData found. Request details:")
+            print(f"  - Content-Type: {request.content_type}")
+            print(f"  - Has JSON: {request.is_json}")
+            print(f"  - Has form: {bool(request.form)}")
+            print(f"  - Has data: {bool(request.data)}")
+            print(f"  - Data length: {len(request.data) if request.data else 0}")
+            if request.data:
+                try:
+                    print(f"  - Data preview: {request.data.decode('utf-8')[:500]}")
+                except:
+                    print(f"  - Data (bytes): {request.data[:100]}")
+            
+            # Если тело запроса полностью пустое, возможно это запрос на проверку доступности
+            # или miniapp открыт не из Telegram
+            if not request.data and not request.form and not request.is_json:
+                print(f"[MINIAPP] Empty request body detected. This might be a health check or miniapp opened outside Telegram.")
+                return jsonify({
+                    "detail": {
+                        "title": "Authorization Error",
+                        "message": "Missing initData. Please open the mini app from Telegram.",
+                        "hint": "The mini app must be opened from Telegram to work properly. If you're testing, make sure to open it through Telegram Web App.",
+                        "error_code": "MISSING_INIT_DATA"
+                    }
+                }), 401
+            
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Missing initData. Please open the mini app from Telegram.",
+                    "hint": "The mini app must be opened from Telegram to work properly.",
+                    "error_code": "MISSING_INIT_DATA"
+                }
+            }), 401
+        
+        # Парсим initData от Telegram Web App
+        # Формат может быть: URL-encoded строка или уже декодированный JSON
+        import urllib.parse
+        import json as json_lib
+        
+        telegram_id = None
+        user_data = None
+        
+        # Пробуем разные форматы
+        try:
+            # Вариант 1: URL-encoded строка (стандартный формат Telegram Web App)
+            if '=' in init_data or '&' in init_data:
+                parsed_data = urllib.parse.parse_qs(init_data)
+                user_str = parsed_data.get('user', [''])[0]
+                
+                if user_str:
+                    # Декодируем JSON из user параметра
+                    try:
+                        user_data = json_lib.loads(urllib.parse.unquote(user_str))
+                        telegram_id = user_data.get('id')
+                    except (json_lib.JSONDecodeError, KeyError) as e:
+                        print(f"[MINIAPP] Error parsing user from URL-encoded initData: {e}")
+                        # Пробуем другой формат
+                        pass
+        except Exception as e:
+            print(f"[MINIAPP] Error parsing URL-encoded initData: {e}")
+        
+        # Вариант 2: Если не получилось, пробуем как JSON напрямую
+        if not telegram_id:
+            try:
+                # Пробуем декодировать как JSON
+                if init_data.startswith('{') or init_data.startswith('['):
+                    parsed_json = json_lib.loads(init_data)
+                    if isinstance(parsed_json, dict):
+                        user_data = parsed_json.get('user') or parsed_json
+                        telegram_id = user_data.get('id') if isinstance(user_data, dict) else None
+            except (json_lib.JSONDecodeError, AttributeError) as e:
+                print(f"[MINIAPP] Error parsing JSON initData: {e}")
+        
+        # Вариант 3: Если initData уже содержит user объект напрямую
+        if not telegram_id and isinstance(data, dict):
+            user_obj = data.get('user')
+            if isinstance(user_obj, dict) and 'id' in user_obj:
+                telegram_id = user_obj.get('id')
+                user_data = user_obj
+        
+        if not telegram_id:
+            print(f"[MINIAPP] Failed to extract telegram_id from initData. Format: {type(init_data)}, Preview: {str(init_data)[:100]}")
+            return jsonify({
+                "detail": {
+                    "title": "Authorization Error",
+                    "message": "Invalid initData format. Please open the mini app from Telegram."
+                }
+            }), 401
+        
+        # Находим пользователя по telegram_id
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        
+        if not user:
+            return jsonify({
+                "detail": {
+                    "title": "User Not Found",
+                    "message": "User not registered. Please register in the bot first.",
+                    "code": "user_not_found"
+                }
+            }), 404
+        
+        # Получаем данные пользователя из RemnaWave (аналогично get_client_me)
+        current_uuid = user.remnawave_uuid
+        
+        # Проверяем кэш
+        cache_key = f'live_data_{current_uuid}'
+        if cached := cache.get(cache_key):
+            # Добавляем данные из локальной БД
+            response_data = cached.copy()
+            response_data.update({
+                'referral_code': user.referral_code,
+                'preferred_lang': user.preferred_lang,
+                'preferred_currency': user.preferred_currency,
+                'telegram_id': user.telegram_id,
+                'telegram_username': user.telegram_username
+            })
+            return jsonify(response_data), 200
+        
+        # Получаем данные из RemnaWave API
+        try:
+            resp = requests.get(
+                f"{API_URL}/api/users/{current_uuid}",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                timeout=10
+            )
+            
+            if resp.status_code != 200:
+                if resp.status_code == 404:
+                    return jsonify({
+                        "detail": {
+                            "title": "Subscription Not Found",
+                            "message": "User not found in VPN system. Please contact support."
+                        }
+                    }), 404
+                return jsonify({
+                    "detail": {
+                        "title": "Subscription Not Found",
+                        "message": f"Failed to fetch subscription data: {resp.status_code}"
+                    }
+                }), 500
+            
+            response_data = resp.json()
+            data = response_data.get('response', {}) if isinstance(response_data, dict) else response_data
+            
+            # Добавляем данные из локальной БД
+            if isinstance(data, dict):
+                data.update({
+                    'referral_code': user.referral_code,
+                    'preferred_lang': user.preferred_lang,
+                    'preferred_currency': user.preferred_currency,
+                    'telegram_id': user.telegram_id,
+                    'telegram_username': user.telegram_username
+                })
+            
+            # Кэшируем на 5 минут
+            cache.set(cache_key, data, timeout=300)
+            
+            print(f"[MINIAPP] Successfully fetched subscription data for user {telegram_id}")
+            print(f"[MINIAPP] Response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+            if isinstance(data, dict):
+                print(f"[MINIAPP] Sample fields: expireAt={data.get('expireAt')}, subscription_url={bool(data.get('subscription_url'))}")
+            
+            return jsonify(data), 200
+            
+        except requests.RequestException as e:
+            print(f"Request Error in miniapp_root_post: {e}")
+            return jsonify({
+                "detail": {
+                    "title": "Subscription Not Found",
+                    "message": f"Failed to connect to VPN system: {str(e)}"
+                }
+            }), 500
+        except Exception as e:
+            print(f"Error in miniapp_root_post: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "detail": {
+                    "title": "Subscription Not Found",
+                    "message": "Internal server error"
+                }
+            }), 500
+            
+    except Exception as e:
+        print(f"Error parsing initData in miniapp_root_post: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "detail": {
+                "title": "Authorization Error",
+                "message": "Invalid initData format."
+            }
+        }), 401
+
+# Маршрут для статических файлов miniapp (должен быть в конце, после всех специфичных маршрутов)
+@app.route('/miniapp/', defaults={'path': ''}, methods=['GET', 'HEAD'])
+@app.route('/miniapp/<path:path>', methods=['GET', 'HEAD'])
+def miniapp_static(path):
+    """
+    Отдача статических файлов miniapp.
+    Этот маршрут должен быть в конце, чтобы не перехватывать специфичные маршруты.
+    """
+    import os
+    miniapp_dir = get_miniapp_path()
+    
+    if not miniapp_dir:
+        return jsonify({"error": "Miniapp directory not found. Set MINIAPP_PATH in .env"}), 404
+    
+    # Если путь пустой или заканчивается на /, отдаем index.html
+    if not path or path.endswith('/'):
+        index_path = os.path.join(miniapp_dir, 'index.html')
+        if os.path.exists(index_path):
+            return send_file(index_path, mimetype='text/html')
+        return jsonify({"error": "index.html not found"}), 404
+    
+    # Безопасность: проверяем, что путь не выходит за пределы директории
+    file_path = os.path.join(miniapp_dir, path)
+    file_path = os.path.normpath(file_path)
+    
+    if not file_path.startswith(os.path.normpath(miniapp_dir)):
+        return jsonify({"error": "Invalid path"}), 403
+    
+    if os.path.isfile(file_path):
+        # Определяем MIME type по расширению
+        mimetype = None
+        if path.endswith('.html'):
+            mimetype = 'text/html'
+        elif path.endswith('.js'):
+            mimetype = 'application/javascript'
+        elif path.endswith('.css'):
+            mimetype = 'text/css'
+        elif path.endswith('.json'):
+            mimetype = 'application/json'
+        elif path.endswith('.png'):
+            mimetype = 'image/png'
+        elif path.endswith('.jpg') or path.endswith('.jpeg'):
+            mimetype = 'image/jpeg'
+        elif path.endswith('.svg'):
+            mimetype = 'image/svg+xml'
+        
+        return send_file(file_path, mimetype=mimetype)
+    
+    # Если файл не найден, но это может быть SPA роутинг - отдаем index.html
+    index_path = os.path.join(miniapp_dir, 'index.html')
+    if os.path.exists(index_path):
+        return send_file(index_path, mimetype='text/html')
+    
+    return jsonify({"error": "File not found"}), 404
 
 if __name__ == '__main__':
     with app.app_context():
