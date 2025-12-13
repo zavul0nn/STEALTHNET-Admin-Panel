@@ -1,3 +1,4 @@
+### Это пример когфига для запуска в ручную , если запуск через докер то 127.0.0.1 меняете на api, готовый конфиг в папке nginx
 server {
 
     server_name panel.stealthnet.app; # ❗️ ВАШ IP-АДРЕС СЮДА
@@ -79,6 +80,7 @@ server {
 
     server_name panel.stealthnet.app;
     return 404; # managed by Certbot
+
 
 
 }
