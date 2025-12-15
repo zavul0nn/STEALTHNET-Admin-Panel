@@ -30,7 +30,7 @@ docker compose version
 
 ```bash
 cd /opt
-git clone https://github.com/GOFONCK/STEALTHNET-Admin-Panel.git
+git clone https://github.com/GOFONCK/remnawave-STEALTHNET-Panel.git
 cd STEALTHNET-Admin-Panel
 ```
 
@@ -115,4 +115,5 @@ curl http://localhost:5000/api/public/health
 ---
 
 **Подробная инструкция**: [INSTALLATION.md](./INSTALLATION.md)
+
 
