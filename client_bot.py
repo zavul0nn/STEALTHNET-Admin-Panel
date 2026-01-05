@@ -53,8 +53,13 @@ LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 _bot_config_cache = {
     'data': None,
     'last_update': 0,
-    'cache_ttl': 60  # 1 минута — изменения применяются автоматически
+    'cache_ttl': 10  # 10 секунд — для быстрого обновления при изменении в админке
 }
+
+def clear_bot_config_cache():
+    """Очистить кеш конфигурации бота"""
+    _bot_config_cache['data'] = None
+    _bot_config_cache['last_update'] = 0
 
 def get_bot_config() -> dict:
     """Получить конфигурацию бота из API с кешированием"""
@@ -268,7 +273,7 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
         'agreement': {
             'icon': '📄',
             'text_key': 'user_agreement_button',
-            'type': 'callback',
+            'type': 'callback',  # Будет изменено динамически если есть ссылка
             'callback_data': 'user_agreement',
             'condition': True,
             'visibility_key': 'agreement',
@@ -277,7 +282,7 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
         'offer': {
             'icon': '📋',
             'text_key': 'offer_button',
-            'type': 'callback',
+            'type': 'callback',  # Будет изменено динамически если есть ссылка
             'callback_data': 'offer',
             'condition': True,
             'visibility_key': 'offer',
@@ -293,6 +298,24 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
             'single': True
         }
     }
+    
+    # Получаем брендинг для проверки ссылок на документы
+    try:
+        api = ClientBotAPI()
+        branding = api.get_branding()
+        agreement_url = branding.get('user_agreement_url', '')
+        offer_url = branding.get('offer_url', '')
+    except:
+        agreement_url = ''
+        offer_url = ''
+    
+    # Обновляем тип кнопок для документов, если есть ссылки
+    if agreement_url and agreement_url.strip():
+        button_definitions['agreement']['type'] = 'url'
+        button_definitions['agreement']['url'] = agreement_url.strip()
+    if offer_url and offer_url.strip():
+        button_definitions['offer']['type'] = 'url'
+        button_definitions['offer']['url'] = offer_url.strip()
     
     # Собираем видимые кнопки в нужном порядке
     visible_buttons = []
@@ -521,14 +544,47 @@ async def safe_edit_or_send_with_logo(update: Update, context: ContextTypes.DEFA
                 logger.warning(f"Failed to edit photo caption: {e}")
     
     # Пробуем отредактировать текстовое сообщение
+    # Но если у нас есть логотип и мы хотим его показать, лучше удалить старое и отправить новое
     if has_text:
+        # Если есть логотип, удаляем старое текстовое сообщение и отправляем новое с логотипом
+        if os.path.exists(LOGO_PATH):
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.debug(f"Could not delete old text message: {e}")
+            
+            # Отправляем новое сообщение с логотипом
+            try:
+                with open(LOGO_PATH, 'rb') as logo_file:
+                    return await context.bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=logo_file,
+                        caption=display_text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode
+                    )
+            except Exception as e2:
+                logger.warning(f"Error sending photo with logo: {e2}")
+                # Fallback: отправляем без форматирования
+                try:
+                    with open(LOGO_PATH, 'rb') as logo_file:
+                        return await context.bot.send_photo(
+                            chat_id=message.chat.id,
+                            photo=logo_file,
+                            caption=clean_markdown_for_cards(display_text),
+                            reply_markup=reply_markup
+                        )
+                except Exception as e3:
+                    logger.error(f"Failed to send photo: {e3}")
+        
+        # Если нет логотипа, просто редактируем текст
         try:
             await query.edit_message_text(
                 text=display_text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode
             )
-            return
+            return query.message  # Возвращаем сообщение для получения message_id
         except Exception as e:
             error_str = str(e).lower()
             # Если ошибка парсинга Markdown, пробуем без форматирования
@@ -538,12 +594,12 @@ async def safe_edit_or_send_with_logo(update: Update, context: ContextTypes.DEFA
                         text=clean_markdown_for_cards(display_text),
                         reply_markup=reply_markup
                     )
-                    return
+                    return query.message
                 except Exception as e2:
                     logger.warning(f"Failed to edit text without formatting: {e2}")
             # Если сообщение не изменилось
             elif "message is not modified" in error_str:
-                return  # Просто игнорируем
+                return query.message  # Просто игнорируем
             else:
                 logger.warning(f"Failed to edit text message: {e}")
     
@@ -624,6 +680,12 @@ class ClientBotAPI:
             if response.status_code == 200:
                 data = response.json()
                 return data.get("token")
+            elif response.status_code == 403:
+                # Аккаунт заблокирован
+                data = response.json()
+                if data.get("code") == "ACCOUNT_BLOCKED":
+                    # Возвращаем специальный маркер блокировки
+                    return {"blocked": True, "block_reason": data.get("block_reason", "")}
         except Exception as e:
             logger.error(f"Ошибка получения токена: {e}")
         
@@ -713,6 +775,45 @@ class ClientBotAPI:
         except Exception as e:
             logger.error(f"Ошибка получения тарифов: {e}")
         return []
+    
+    def get_tariff_features(self) -> dict:
+        """Получить функции тарифов по tier"""
+        try:
+            response = self.session.get(
+                f"{self.api_url}/api/public/tariff-features",
+                timeout=10
+            )
+            if response.status_code == 200:
+                features_list = response.json()
+                # Преобразуем список в словарь по tier
+                features_dict = {}
+                for item in features_list:
+                    tier = item.get("tier")
+                    features_json = item.get("features")
+                    if tier and features_json:
+                        try:
+                            import json
+                            features = json.loads(features_json) if isinstance(features_json, str) else features_json
+                            features_dict[tier] = features if isinstance(features, list) else []
+                        except:
+                            features_dict[tier] = []
+                return features_dict
+        except Exception as e:
+            logger.error(f"Ошибка получения функций тарифов: {e}")
+        return {}
+    
+    def get_branding(self) -> dict:
+        """Получить настройки брендинга (для названий функций)"""
+        try:
+            response = self.session.get(
+                f"{self.api_url}/api/public/branding",
+                timeout=10
+            )
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.error(f"Ошибка получения брендинга: {e}")
+        return {}
     
     def get_system_settings(self) -> dict:
         """Получить системные настройки (активные языки и валюты) с кэшированием на 1 минуту"""
@@ -1015,10 +1116,13 @@ TRANSLATIONS = {
         'support_button': 'Поддержка',
         'settings_button': 'Настройки',
         'cabinet_button': 'Кабинет',
+        'documents_button': 'Документы',
         'user_agreement_button': 'Соглашение',
         'offer_button': 'Оферта',
+        'refund_policy_button': 'Политика возврата',
         'user_agreement_title': '📄 Пользовательское соглашение',
         'offer_title': '📋 Публичная оферта',
+        'refund_policy_title': '💰 Политика возврата',
         'subscription_link': 'Ссылка подключения',
         'traffic_usage': 'Использование трафика',
         'unlimited_traffic_full': 'Безлимитный трафик',
@@ -1228,10 +1332,13 @@ TRANSLATIONS = {
         'support_button': 'Підтримка',
         'settings_button': 'Налаштування',
         'cabinet_button': 'Кабінет',
+        'documents_button': 'Документи',
         'user_agreement_button': 'Угода',
         'offer_button': 'Оферта',
+        'refund_policy_button': 'Політика повернення',
         'user_agreement_title': '📄 Користувацька угода',
         'offer_title': '📋 Публічна оферта',
+        'refund_policy_title': '💰 Політика повернення',
         'subscription_link': 'Посилання підключення',
         'traffic_usage': 'Використання трафіку',
         'unlimited_traffic_full': 'Безлімітний трафік',
@@ -1441,10 +1548,13 @@ TRANSLATIONS = {
         'support_button': 'Support',
         'settings_button': 'Settings',
         'cabinet_button': 'Cabinet',
+        'documents_button': 'Documents',
         'user_agreement_button': 'Agreement',
         'offer_button': 'Offer',
+        'refund_policy_button': 'Refund Policy',
         'user_agreement_title': '📄 User Agreement',
         'offer_title': '📋 Public Offer',
+        'refund_policy_title': '💰 Refund Policy',
         'subscription_link': 'Connection Link',
         'traffic_usage': 'Traffic Usage',
         'unlimited_traffic_full': 'Unlimited Traffic',
@@ -1654,10 +1764,13 @@ TRANSLATIONS = {
         'support_button': '支持',
         'settings_button': '设置',
         'cabinet_button': '办公室',
+        'documents_button': '文件',
         'user_agreement_button': '协议',
         'offer_button': '要约',
+        'refund_policy_button': '退款政策',
         'user_agreement_title': '📄 用户协议',
         'offer_title': '📋 公开要约',
+        'refund_policy_title': '💰 退款政策',
         'subscription_link': '连接链接',
         'traffic_usage': '流量使用',
         'unlimited_traffic_full': '无限流量',
@@ -1829,16 +1942,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем токен для пользователя
     token = get_user_token(telegram_id)
     
-    if not token:
+    # Проверяем блокировку аккаунта
+    if isinstance(token, dict) and token.get('blocked'):
+        block_reason = token.get('block_reason', '') or "Ваш аккаунт заблокирован"
+        text = f"🚫 **Ваш аккаунт заблокирован**\n\n"
+        text += f"📝 **Причина:**\n{block_reason}\n\n"
+        text += "━━━━━━━━━━━━━━━\n\n"
+        text += "⚠️ Если вы считаете, что вас заблокировали ошибочно, свяжитесь с администрацией.\n\n"
+        text += "💬 Для связи с поддержкой используйте кнопку ниже:"
+        
+        keyboard = [
+            [InlineKeyboardButton("💬 Связаться с поддержкой", callback_data="support")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await reply_with_logo(update, text, reply_markup=reply_markup, parse_mode="Markdown")
+        return
+    
+    if not token or not isinstance(token, str):
         # Пользователь не зарегистрирован - предлагаем регистрацию
         # Используем русский язык по умолчанию для незарегистрированных пользователей
         lang = 'ru'
+        
+        # Проверяем реферальный код из команды /start
+        referral_code = None
+        if context.args and len(context.args) > 0:
+            referral_code = context.args[0]
+            # Сохраняем реферальный код в user_data для использования при регистрации
+            context.user_data['ref_code'] = referral_code
+        
         keyboard = [
             [
                 InlineKeyboardButton(f"✅ {get_text('register', lang)}", callback_data="register_user")
             ],
             [
-                InlineKeyboardButton(f"🌐 {get_text('register', lang)} {get_text('on_site', lang)}", url=f"{YOUR_SERVER_IP}/register")
+                InlineKeyboardButton(f"🌐 {get_text('register', lang)} {get_text('on_site', lang)}", url=f"{YOUR_SERVER_IP}/register?ref={referral_code}" if referral_code else f"{YOUR_SERVER_IP}/register")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1847,6 +1985,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"❌ {get_text('not_registered_text', lang)}\n\n"
         text += f"📝 {get_text('register_here', lang)}\n\n"
         text += f"💡 {get_text('after_register', lang)}"
+        if referral_code:
+            text += f"\n\n🎁 Реферальный код: `{referral_code}`"
         
         await reply_with_logo(update, text, reply_markup=reply_markup)
         return
@@ -1865,7 +2005,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Формируем приветственное сообщение с подробной информацией
     welcome_text = f"🛡 **{get_text('stealthnet_bot', user_lang)}**\n"
     welcome_text += f"👋 {get_text('welcome_user', user_lang)}, {user.first_name}!\n"
-    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+    welcome_text += "━━━━━━━━━━━━━━━\n"
     
     # Баланс
     balance = user_data.get("balance", 0)
@@ -1937,12 +2077,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**  - {progress_color} {progress_bar} {percentage:.0f}% ({used_gb:.2f} / {limit_gb:.2f} GB)\n"
         
-        welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+        welcome_text += "━━━━━━━━━━━━━━━\n"
     else:
         welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
         welcome_text += f"🔴 {get_text('inactive', user_lang)}\n"
         welcome_text += f"💡 {get_text('activate_trial_button', user_lang)}\n"
-        welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+        welcome_text += "━━━━━━━━━━━━━━━\n"
     
     # Кнопки главного меню - строим динамически из конфига
     keyboard = build_main_menu_keyboard(user_lang, is_active, subscription_url, expire_at)
@@ -2011,7 +2151,7 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
     
     status_text = f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
-    status_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    status_text += "━━━━━━━━━━━━━━━\n\n"
     
     # Баланс
     status_text += f"💰 **Баланс:** {balance:.2f} {currency_symbol}\n\n"
@@ -2052,7 +2192,7 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_text += f"📥 {used_gb:.2f} / {limit_gb:.2f} GB\n\n"
     
     # Данные для входа - современный дизайн
-    status_text += "━━━━━━━━━━━━━━━━━━━━\n"
+    status_text += "━━━━━━━━━━━━━━━\n"
     status_text += f"🔐 **{get_text('login_data_title', user_lang)}**\n"
     
     credentials = api.get_credentials(telegram_id)
@@ -2159,7 +2299,7 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Формируем сообщение с выбором типа тарифа
     text = "💎 **Тарифные планы**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━\n"
     
     # Показываем краткую информацию о каждом типе в одну строку
     if basic_tariffs:
@@ -2174,7 +2314,7 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         min_price = min(t.get(currency_config["field"], 0) for t in elite_tariffs)
         text += f"👑 Элитный |💰От {min_price:.0f} {symbol} |📦 {len(elite_tariffs)} вариантов\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━\n"
     
     # Кнопки выбора типа тарифа
     keyboard = []
@@ -2270,10 +2410,42 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # Сортируем по длительности
     tier_tariffs.sort(key=lambda x: x.get("duration_days", 0))
     
+    # Получаем функции тарифа для этого tier
+    tariff_features = api.get_tariff_features()
+    features_list = tariff_features.get(tier, [])
+    
+    # Получаем названия функций из брендинга
+    branding = api.get_branding()
+    features_names = branding.get("tariff_features_names", {})
+    
     # Формируем сообщение
     tier_name = tier_names.get(tier, tier.capitalize())
     text = f"{tier_name} **тарифы**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━\n"
+    
+    # Показываем функции тарифа, если есть
+    if features_list:
+        text += "✨ **Включено в тариф:**\n"
+        for feature in features_list[:5]:  # Показываем первые 5 функций
+            if isinstance(feature, dict):
+                feature_key = feature.get("key") or feature.get("name")
+                feature_name = feature.get("name") or feature.get("title")
+                # Пробуем получить название из брендинга
+                if feature_key and features_names and isinstance(features_names, dict):
+                    branded_name = features_names.get(feature_key)
+                    if branded_name:
+                        feature_name = branded_name
+                if not feature_name:
+                    feature_name = feature_key or "Функция"
+                
+                icon = feature.get("icon", "✓")
+                text += f"{icon} {feature_name}\n"
+            elif isinstance(feature, str):
+                text += f"✓ {feature}\n"
+        if len(features_list) > 5:
+            text += f"... и еще {len(features_list) - 5} функций\n"
+        text += "\n"
+    
     text += "📅 Выберите длительность:\n\n"
     
     # Показываем список тарифов в одну строку
@@ -2283,10 +2455,9 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         duration = tariff.get("duration_days", 0)
         per_day = price / duration if duration > 0 else price
         
-        text += f"📦 **{name}** | 💰 {price:.0f} {symbol}|📊 {per_day:.2f} {symbol}/день\n"
-        text += f"⏱️ {duration} дней\n\n"
+        text += f"📦 **{name}** | 💰 {price:.0f} {symbol} | 📊 {per_day:.2f} {symbol}/день | ⏱️ {duration} дней\n\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━\n"
     
     # Кнопки выбора длительности
     keyboard = []
@@ -2411,7 +2582,7 @@ async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать реферальную программу"""
+    """Показать реферальную программу (с поддержкой новой процентной системы)"""
     user = update.effective_user
     telegram_id = user.id
     
@@ -2428,41 +2599,111 @@ async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем язык пользователя
     user_lang = get_user_lang(user_data, context, token)
     
-    referral_code = user_data.get("referral_code", "")
-    
-    # Получаем домен сервера из API
+    # Получаем информацию о реферальной программе из API
     try:
-        domain_resp = api.session.get(f"{FLASK_API_URL}/api/public/server-domain", timeout=5)
-        if domain_resp.status_code == 200:
-            domain_data = domain_resp.json()
-            server_domain = domain_data.get("full_url") or domain_data.get("domain") or YOUR_SERVER_IP
+        ref_resp = api.session.get(
+            f"{FLASK_API_URL}/api/client/referrals/info",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5
+        )
+        if ref_resp.status_code == 200:
+            ref_data = ref_resp.json()
+            referral_code = ref_data.get("referral_code", "")
+            referral_link_direct = ref_data.get("referral_link_direct", "")
+            referral_link_telegram = ref_data.get("referral_link_telegram", "")
+            referral_info = ref_data.get("referral_info", {})
+            referrals_count = ref_data.get("referrals_count", 0)
         else:
-            server_domain = YOUR_SERVER_IP
-    except:
-        server_domain = YOUR_SERVER_IP
+            # Fallback на старую логику
+            referral_code = user_data.get("referral_code", "")
+            referral_link_direct = ""
+            referral_link_telegram = ""
+            referral_info = {}
+            referrals_count = 0
+    except Exception as e:
+        logger.warning(f"Error fetching referral info: {e}")
+        # Fallback на старую логику
+        referral_code = user_data.get("referral_code", "")
+        referral_link_direct = ""
+        referral_link_telegram = ""
+        referral_info = {}
+        referrals_count = 0
     
-    # Формируем ссылку
-    if referral_code:
+    # Если нет данных из API, используем старую логику
+    if not referral_code:
+        referral_code = user_data.get("referral_code", "")
+        if not referral_code:
+            text = f"❌ {get_text('referral_code_not_found', user_lang)}\n"
+            keyboard = [[InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup)
+            return
+        
+        # Получаем домен сервера из API
+        try:
+            domain_resp = api.session.get(f"{FLASK_API_URL}/api/public/server-domain", timeout=5)
+            if domain_resp.status_code == 200:
+                domain_data = domain_resp.json()
+                server_domain = domain_data.get("full_url") or domain_data.get("domain") or YOUR_SERVER_IP
+            else:
+                server_domain = YOUR_SERVER_IP
+        except:
+            server_domain = YOUR_SERVER_IP
+        
         if not server_domain.startswith("http"):
             server_domain = f"https://{server_domain}"
-        referral_link = f"{server_domain}/register?ref={referral_code}"
-    else:
-        referral_link = ""
-    
-    text = f"🎁 **{get_text('referral_program', user_lang)}**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"💡 {get_text('invite_friends', user_lang)}\n\n"
-    
-    if referral_code:
-        # Современный дизайн для реферальной ссылки
-        text += f"🔗 **{get_text('your_referral_link', user_lang)}**\n"
-        text += f"`{referral_link}`\n\n"
+        referral_link_direct = f"{server_domain}/register?ref={referral_code}"
         
-        # Код
+        # Для старого бота используем имя бота для реферальных ссылок
+        # Приоритет: TELEGRAM_BOT_NAME_V2 -> TELEGRAM_BOT_NAME -> BOT_USERNAME -> CLIENT_BOT_USERNAME
+        # Если нет TELEGRAM_BOT_NAME_V2, используем TELEGRAM_BOT_NAME
+        bot_username = os.getenv("TELEGRAM_BOT_NAME_V2") or os.getenv("TELEGRAM_BOT_NAME") or os.getenv("BOT_USERNAME") or os.getenv("CLIENT_BOT_USERNAME", "stealthnet_vpn_bot")
+        # Убираем @ если есть
+        if bot_username.startswith('@'):
+            bot_username = bot_username[1:]
+        referral_link_telegram = f"https://t.me/{bot_username}?start={referral_code}"
+    
+    # Формируем текст сообщения
+    text = f"🎁 **{get_text('referral_program', user_lang)}**\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
+    
+    # Информация о типе реферальной системы
+    if referral_info:
+        ref_type = referral_info.get("type", "DAYS")
+        if ref_type == "PERCENT":
+            # Процентная система
+            text += f"💰 **{referral_info.get('title', 'Реферальная программа с процентами')}**\n\n"
+            text += f"💡 {referral_info.get('description', 'Приглашайте друзей и получайте процент с их покупок!')}\n\n"
+            text += f"📊 **Ваш процент:** {referral_info.get('your_percent', '10%')}\n"
+            text += f"👥 **Приглашено:** {referrals_count} чел.\n\n"
+            text += "**Как это работает:**\n"
+            for step in referral_info.get("how_it_works", []):
+                text += f"• {step}\n"
+        else:
+            # Система на дни
+            text += f"📅 **{referral_info.get('title', 'Реферальная программа на дни')}**\n\n"
+            text += f"💡 {referral_info.get('description', 'Приглашайте друзей и получайте бесплатные дни!')}\n\n"
+            text += f"🎁 **Бонус приглашенному:** {referral_info.get('invitee_bonus', '3 дня')}\n"
+            text += f"🎁 **Ваш бонус:** {referral_info.get('referrer_bonus', '3 дня за каждого')}\n"
+            text += f"👥 **Приглашено:** {referrals_count} чел.\n\n"
+            text += "**Как это работает:**\n"
+            for step in referral_info.get("how_it_works", []):
+                text += f"• {step}\n"
+    else:
+        text += f"💡 {get_text('invite_friends', user_lang)}\n\n"
+    
+    text += "\n━━━━━━━━━━━━━━━\n\n"
+    
+    # Реферальные ссылки
+    if referral_code:
+        text += f"🔗 **{get_text('your_referral_link', user_lang)}**\n"
+        text += f"`{referral_link_direct}`\n\n"
+        
+        text += f"🤖 **Ссылка через бота:**\n"
+        text += f"`{referral_link_telegram}`\n\n"
+        
         text += f"📝 **{get_text('your_code', user_lang)}**\n"
         text += f"`{referral_code}`\n"
-    else:
-        text += f"❌ {get_text('referral_code_not_found', user_lang)}\n"
     
     keyboard = [
         [InlineKeyboardButton(f"📋 {get_text('copy_link', user_lang)}", callback_data=f"copy_ref_{referral_code}")],
@@ -2501,7 +2742,7 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_lang = get_user_lang(user_data, context, token)
     
     text = f"💬 **{get_text('support_title', user_lang)}**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     
     if tickets:
         text += f"📋 **{get_text('your_tickets', user_lang)}:** ({len(tickets)})\n\n"
@@ -2600,7 +2841,7 @@ def get_user_agreement_text(lang: str = 'ru') -> str:
     texts = {
         'ru': """📄 **Пользовательское соглашение**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **1. Общие положения**
 
@@ -2633,7 +2874,7 @@ def get_user_agreement_text(lang: str = 'ru') -> str:
 5.2. Администрация Сервиса оставляет за собой право изменять условия Соглашения.""",
         'ua': """📄 **Користувацька угода**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **1. Загальні положення**
 
@@ -2666,7 +2907,7 @@ def get_user_agreement_text(lang: str = 'ru') -> str:
 5.2. Адміністрація Сервісу залишає за собою право змінювати умови Угоди.""",
         'en': """📄 **User Agreement**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **1. General Provisions**
 
@@ -2699,7 +2940,7 @@ def get_user_agreement_text(lang: str = 'ru') -> str:
 5.2. The Service Administration reserves the right to change the terms of the Agreement.""",
         'cn': """📄 **用户协议**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **1. 总则**
 
@@ -2747,7 +2988,7 @@ def get_offer_text(lang: str = 'ru') -> str:
     texts = {
         'ru': """📋 **Публичная оферта**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **Оферта на оказание услуг VPN**
 
@@ -2800,7 +3041,7 @@ def get_offer_text(lang: str = 'ru') -> str:
 7.2. Настоящая Оферта вступает в силу с момента публикации на сайте.""",
         'ua': """📋 **Публічна оферта**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **Оферта на надання послуг VPN**
 
@@ -2853,7 +3094,7 @@ def get_offer_text(lang: str = 'ru') -> str:
 7.2. Ця Оферта набуває чинності з моменту публікації на сайті.""",
         'en': """📋 **Public Offer**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **Offer for VPN Services**
 
@@ -2906,7 +3147,7 @@ This document is a public offer (hereinafter — "Offer") addressed to individua
 7.2. This Offer comes into force from the moment of publication on the website.""",
         'cn': """📋 **公开要约**
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 
 **VPN 服务要约**
 
@@ -2969,6 +3210,182 @@ This document is a public offer (hereinafter — "Offer") addressed to individua
     return text.format(SERVICE_NAME=get_service_name())
 
 
+def get_refund_policy_text(lang: str = 'ru') -> str:
+    """Получить текст политики возврата на указанном языке"""
+    texts = {
+        'ru': """💰 **Политика возврата**
+
+━━━━━━━━━━━━━━━
+
+**Условия возврата средств**
+
+1. **Общие положения**
+
+1.1. Настоящая Политика возврата (далее — «Политика») определяет условия и порядок возврата денежных средств за услуги {SERVICE_NAME} VPN (далее — «Сервис»).
+
+1.2. Возврат средств возможен только в случаях, предусмотренных настоящей Политикой.
+
+**2. Условия возврата**
+
+2.1. Возврат средств производится в следующих случаях:
+   - Технические проблемы, не позволяющие использовать услугу более 48 часов
+   - Ошибка при оплате (двойная оплата, неправильная сумма)
+   - Отказ в предоставлении услуги по вине Сервиса
+
+2.2. Возврат средств НЕ производится в следующих случаях:
+   - Пользователь использовал услугу более 7 дней
+   - Нарушение пользователем правил использования сервиса
+   - Блокировка аккаунта за нарушение условий использования
+   - Изменение решения пользователя после начала использования услуги
+
+**3. Порядок возврата**
+
+3.1. Запрос на возврат средств должен быть направлен в службу поддержки в течение 7 дней с момента оплаты.
+
+3.2. Возврат средств производится на тот же способ оплаты, которым была произведена оплата.
+
+3.3. Срок возврата средств составляет от 3 до 14 рабочих дней в зависимости от способа оплаты.
+
+**4. Контакты**
+
+4.1. Для оформления возврата средств обратитесь в службу поддержки через раздел "Поддержка" в боте или на сайте.""",
+        'ua': """💰 **Політика повернення**
+
+━━━━━━━━━━━━━━━
+
+**Умови повернення коштів**
+
+1. **Загальні положення**
+
+1.1. Ця Політика повернення (далі — «Політика») визначає умови та порядок повернення коштів за послуги {SERVICE_NAME} VPN (далі — «Сервіс»).
+
+1.2. Повернення коштів можливе лише у випадках, передбачених цією Політикою.
+
+**2. Умови повернення**
+
+2.1. Повернення коштів здійснюється у таких випадках:
+   - Технічні проблеми, що не дозволяють використовувати послугу більше 48 годин
+   - Помилка при оплаті (подвійна оплата, неправильна сума)
+   - Відмова в наданні послуги з вини Сервісу
+
+2.2. Повернення коштів НЕ здійснюється у таких випадках:
+   - Користувач використав послугу більше 7 днів
+   - Порушення користувачем правил використання сервісу
+   - Блокування акаунта за порушення умов використання
+   - Зміна рішення користувача після початку використання послуги
+
+**3. Порядок повернення**
+
+3.1. Запит на повернення коштів має бути направлений до служби підтримки протягом 7 днів з моменту оплати.
+
+3.2. Повернення коштів здійснюється на той самий спосіб оплати, яким була здійснена оплата.
+
+3.3. Термін повернення коштів становить від 3 до 14 робочих днів залежно від способу оплати.
+
+**4. Контакти**
+
+4.1. Для оформлення повернення коштів зверніться до служби підтримки через розділ "Підтримка" в боті або на сайті.""",
+        'en': """💰 **Refund Policy**
+
+━━━━━━━━━━━━━━━
+
+**Refund Terms**
+
+1. **General Provisions**
+
+1.1. This Refund Policy (hereinafter — "Policy") defines the terms and procedure for refunding funds for {SERVICE_NAME} VPN services (hereinafter — "Service").
+
+1.2. Refunds are possible only in cases provided for by this Policy.
+
+**2. Refund Conditions**
+
+2.1. Refunds are made in the following cases:
+   - Technical problems that prevent the use of the service for more than 48 hours
+   - Payment error (double payment, incorrect amount)
+   - Refusal to provide service due to the fault of the Service
+
+2.2. Refunds are NOT made in the following cases:
+   - The user has used the service for more than 7 days
+   - User's violation of the service usage rules
+   - Account blocking for violation of terms of use
+   - User's change of decision after starting to use the service
+
+**3. Refund Procedure**
+
+3.1. A refund request must be sent to the support service within 7 days from the date of payment.
+
+3.2. Refunds are made to the same payment method used for payment.
+
+3.3. The refund period is from 3 to 14 business days depending on the payment method.
+
+**4. Contacts**
+
+4.1. To request a refund, contact the support service through the "Support" section in the bot or on the website.""",
+        'cn': """💰 **退款政策**
+
+━━━━━━━━━━━━━━━
+
+**退款条款**
+
+1. **总则**
+
+1.1. 本退款政策（以下简称"政策"）规定了{SERVICE_NAME} VPN服务（以下简称"服务"）的退款条件和程序。
+
+1.2. 只有在符合本政策规定的情况下才能退款。
+
+**2. 退款条件**
+
+2.1. 在以下情况下可以退款：
+   - 技术问题导致服务无法使用超过48小时
+   - 支付错误（重复支付、金额错误）
+   - 由于服务方原因拒绝提供服务
+
+2.2. 在以下情况下不退款：
+   - 用户使用服务超过7天
+   - 用户违反服务使用规则
+   - 因违反使用条款而被封禁账户
+   - 用户在使用服务后改变决定
+
+**3. 退款程序**
+
+3.1. 退款请求必须在付款后7天内发送给支持服务。
+
+3.2. 退款将退回到用于付款的同一支付方式。
+
+3.3. 退款期限为3至14个工作日，具体取决于支付方式。
+
+**4. 联系方式**
+
+4.1. 要申请退款，请通过机器人或网站上的"支持"部分联系支持服务。"""
+    }
+    
+    text = texts.get(lang, texts['ru'])
+    # Форматируем текст, заменяя {SERVICE_NAME} на актуальное значение
+    return text.format(SERVICE_NAME=get_service_name())
+
+
+async def show_refund_policy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать политику возврата"""
+    telegram_id = update.effective_user.id
+    token = get_user_token(telegram_id)
+    user_lang = get_user_lang(None, context, token)
+    
+    # Текст политики возврата
+    policy_text = get_refund_policy_text(user_lang)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Используем безопасную функцию для редактирования
+    try:
+        await safe_edit_or_send_with_logo(update, context, policy_text, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Error in show_refund_policy: {e}")
+        await safe_edit_or_send_with_logo(update, context, clean_markdown_for_cards(policy_text), reply_markup=reply_markup)
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на inline кнопки"""
     query = update.callback_query
@@ -3013,7 +3430,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 welcome_text = f"🛡 **{get_text('stealthnet_bot', user_lang)}**\n"
                 welcome_text += f"👋 {get_text('main_menu_button', user_lang)}\n"
-                welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+                welcome_text += "━━━━━━━━━━━━━━━\n"
                 
                 # Баланс
                 balance = user_data.get("balance", 0)
@@ -3085,54 +3502,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         
                         welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**  - {progress_color} {progress_bar} {percentage:.0f}% ({used_gb:.2f} / {limit_gb:.2f} GB)\n"
                     
-                    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+                    welcome_text += "━━━━━━━━━━━━━━━\n"
                 else:
                     welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
                     welcome_text += f"🔴 {get_text('inactive', user_lang)}\n"
-                    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+                    welcome_text += "━━━━━━━━━━━━━━━\n"
                 
-                keyboard = []
-                
-                # Кнопка подключения
-                if is_active and subscription_url:
-                    keyboard.append([
-                        InlineKeyboardButton(f"🚀 {get_text('connect_button', user_lang)}", url=subscription_url)
-                    ])
-                
-                # Кнопка активации триала (если подписка не активна)
-                if not is_active or not expire_at:
-                    keyboard.append([
-                        InlineKeyboardButton(f"🎁 {get_text('activate_trial_button', user_lang)}", callback_data="activate_trial")
-                    ])
-                
-                keyboard.extend([
-                    [
-                        InlineKeyboardButton(f"📊 {get_text('status_button', user_lang)}", callback_data="status"),
-                        InlineKeyboardButton(f"💎 {get_text('tariffs_button', user_lang)}", callback_data="tariffs")
-                    ],
-                    [
-                        InlineKeyboardButton(f"💰 {get_text('top_up_balance', user_lang)}", callback_data="topup_balance"),
-                        InlineKeyboardButton(f"🌐 {get_text('servers_button', user_lang)}", callback_data="servers")
-                    ],
-                    [
-                        InlineKeyboardButton(f"🎁 {get_text('referrals_button', user_lang)}", callback_data="referrals"),
-                        InlineKeyboardButton(f"💬 {get_text('support_button', user_lang)}", callback_data="support")
-                    ],
-                    [
-                        InlineKeyboardButton(f"⚙️ {get_text('settings_button', user_lang)}", callback_data="settings")
-                    ],
-                    [
-                        InlineKeyboardButton(f"📄 {get_text('user_agreement_button', user_lang)}", callback_data="user_agreement"),
-                        InlineKeyboardButton(f"📋 {get_text('offer_button', user_lang)}", callback_data="offer")
-                    ]
-                ])
-                
-                # Web App кнопка
-                if MINIAPP_URL and MINIAPP_URL.startswith("https://"):
-                    keyboard.append([
-                        InlineKeyboardButton(f"📱 {get_text('cabinet_button', user_lang)}", web_app=WebAppInfo(url=MINIAPP_URL))
-                    ])
-                
+                # Используем build_main_menu_keyboard для правильного порядка кнопок из админки
+                keyboard = build_main_menu_keyboard(user_lang, is_active, subscription_url, expire_at)
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 # Используем безопасную функцию для редактирования/отправки
@@ -3171,8 +3548,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"⚙️ {get_text('settings_button', lang)}", callback_data="settings")
             ],
             [
-                InlineKeyboardButton(f"📄 {get_text('user_agreement_button', lang)}", callback_data="user_agreement"),
-                InlineKeyboardButton(f"📋 {get_text('offer_button', lang)}", callback_data="offer")
+                InlineKeyboardButton(f"📚 {get_text('documents_button', lang)}", callback_data="documents")
             ]
         ]
         
@@ -3239,7 +3615,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_for_topup_amount"] = True
         
         text = f"💰 **{get_text('top_up_balance', user_lang)}**\n"
-        text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        text += "━━━━━━━━━━━━━━━\n\n"
         text += f"📝 {get_text('enter_amount', user_lang)}\n\n"
         text += f"💡 Введите сумму в {currency_symbol} (например: 1500 или 1500.50)"
         
@@ -3294,6 +3670,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             server_domain = f"https://{server_domain}"
         referral_link = f"{server_domain}/register?ref={referral_code}"
         
+        # Формируем ссылку через бота
+        # Приоритет: TELEGRAM_BOT_NAME_V2 -> TELEGRAM_BOT_NAME -> BOT_USERNAME -> CLIENT_BOT_USERNAME
+        # Если нет TELEGRAM_BOT_NAME_V2, используем TELEGRAM_BOT_NAME
+        bot_username = os.getenv("TELEGRAM_BOT_NAME_V2") or os.getenv("TELEGRAM_BOT_NAME") or os.getenv("BOT_USERNAME") or os.getenv("CLIENT_BOT_USERNAME", "stealthnet_vpn_bot")
+        if bot_username.startswith('@'):
+            bot_username = bot_username[1:]
+        referral_link_telegram = f"https://t.me/{bot_username}?start={referral_code}"
+        
         # Отправляем ссылку отдельным сообщением для удобного копирования
         await query.answer(f"✅ {get_text('link_sent_to_chat', user_lang)}", show_alert=False)
         # Создаем Update объект для reply_with_logo
@@ -3302,6 +3686,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temp_update,
             f"🔗 **{get_text('your_referral_link', user_lang)}**\n\n"
             f"`{referral_link}`\n\n"
+            f"🤖 **Ссылка через бота:**\n"
+            f"`{referral_link_telegram}`\n\n"
             f"{get_text('click_link_to_copy', user_lang)}.",
             parse_mode="Markdown"
         )
@@ -3419,22 +3805,19 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.debug(f"Settings: lang={user_lang}, currency={current_currency}")
     
-    text = f"⚙️ **{get_text('settings', user_lang)}**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = f"⚙️ {get_text('settings', user_lang)}\n"
+    text += "━━━━━━━━━━━━━━━\n"
     
     # Текущие настройки в современном стиле
     currency_names = {"uah": "₴ UAH", "rub": "₽ RUB", "usd": "$ USD"}
     currency_display = currency_names.get(current_currency, 'UAH')
     
-    text += f"💱 **{get_text('currency', user_lang)}**\n"
-    text += f"{currency_display}\n\n"
-    
     lang_names = {"ru": "🇷🇺 Русский", "ua": "🇺🇦 Українська", "en": "🇬🇧 English", "cn": "🇨🇳 中文"}
     lang_display = lang_names.get(user_lang, 'Русский')
     
-    text += f"🌐 **{get_text('language', user_lang)}**\n"
-    text += f"{lang_display}\n\n"
-    
+    text += f"💱 {get_text('currency', user_lang)} - {currency_display}\n"
+    text += f"🌐 {get_text('language', user_lang)} - {lang_display}\n"
+    text += "━━━━━━━━━━━━━━━\n"
     text += f"📝 {get_text('select_currency', user_lang)}\n"
     
     # Получаем активные валюты из настроек
@@ -3495,8 +3878,12 @@ async def set_currency(update: Update, context: ContextTypes.DEFAULT_TYPE, curre
         await query.answer("❌ Ошибка авторизации")
         return
     
-    if currency not in ["uah", "rub", "usd"]:
-        await query.answer("❌ Неверная валюта")
+    # Проверяем, что валюта активна
+    system_settings = api.get_system_settings()
+    active_currencies = system_settings.get("active_currencies", ["uah", "rub", "usd"])
+    
+    if currency not in active_currencies:
+        await query.answer("❌ Эта валюта недоступна", show_alert=True)
         return
     
     # Проверяем текущую валюту
@@ -3592,9 +3979,12 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang:
             logger.error(f"Error in set_language: {e}")
         return
     
-    # Устанавливаем язык
-    if lang not in ["ru", "ua", "en", "cn"]:
-        await query.answer("❌ Неверный язык")
+    # Проверяем, что язык активен
+    system_settings = api.get_system_settings()
+    active_languages = system_settings.get("active_languages", ["ru", "ua", "en", "cn"])
+    
+    if lang not in active_languages:
+        await query.answer("❌ Этот язык недоступен", show_alert=True)
         return
     
     # Проверяем текущий язык
@@ -3668,10 +4058,10 @@ async def view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket
     messages = ticket_data.get("messages", [])
     
     text = f"💬 **{get_text('ticket_view_title', user_lang)} #{ticket_id}**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     text += f"{status_emoji} **{get_text('status_label', user_lang)}:** {status}\n"
     text += f"📋 **{get_text('subject_label', user_lang)}:** {subject}\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     text += f"💬 **{get_text('messages_label', user_lang)}:**\n\n"
     
     # Показываем сообщения
@@ -3735,7 +4125,7 @@ async def show_channel_subscription_required(update: Update, context: ContextTyp
     service_name = get_service_name()
     
     text = f"🛡️ **{service_name} VPN**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     text += f"📢 {subscription_text}\n\n"
     text += "👇 Нажмите кнопку ниже, чтобы подписаться, затем вернитесь и нажмите \"Проверить подписку\""
     
@@ -3783,23 +4173,40 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Используем русский по умолчанию для незарегистрированных
     lang = 'ru'
     
+    # Получаем активные языки из настроек
+    system_settings = api.get_system_settings()
+    active_languages = system_settings.get("active_languages", ["ru", "ua", "en", "cn"])
+    
     text = f"🛡️ **{SERVICE_NAME} VPN**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     
     text += "👋 **Добро пожаловать!**\n\n"
     text += "🌐 Выберите язык интерфейса для удобной работы.\n\n"
     text += "💡 Вы сможете изменить его позже в настройках."
     
-    keyboard = [
-        [
-            InlineKeyboardButton("🇷🇺 Русский", callback_data="reg_lang_ru"),
-            InlineKeyboardButton("🇺🇦 Українська", callback_data="reg_lang_ua")
-        ],
-        [
-            InlineKeyboardButton("🇬🇧 English", callback_data="reg_lang_en"),
-            InlineKeyboardButton("🇨🇳 中文", callback_data="reg_lang_cn")
-        ]
-    ]
+    # Генерируем кнопки языков динамически на основе активных языков
+    lang_names = {
+        "ru": "🇷🇺 Русский",
+        "ua": "🇺🇦 Українська",
+        "en": "🇬🇧 English",
+        "cn": "🇨🇳 中文"
+    }
+    
+    keyboard = []
+    row = []
+    for lang_code in ["ru", "ua", "en", "cn"]:
+        if lang_code in active_languages:
+            row.append(InlineKeyboardButton(
+                lang_names.get(lang_code, lang_code),
+                callback_data=f"reg_lang_{lang_code}"
+            ))
+            if len(row) == 2:  # По 2 кнопки в ряду
+                keyboard.append(row)
+                row = []
+    
+    if row:  # Добавляем оставшиеся кнопки
+        keyboard.append(row)
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Используем безопасную функцию для редактирования/отправки
@@ -3823,6 +4230,14 @@ async def register_select_language(update: Update, context: ContextTypes.DEFAULT
     if not query:
         return
     
+    # Проверяем, что язык активен
+    system_settings = api.get_system_settings()
+    active_languages = system_settings.get("active_languages", ["ru", "ua", "en", "cn"])
+    
+    if lang not in active_languages:
+        await query.answer("❌ Этот язык недоступен", show_alert=True)
+        return
+    
     # Сохраняем выбранный язык
     context.user_data["reg_lang"] = lang
     
@@ -3832,22 +4247,35 @@ async def register_select_language(update: Update, context: ContextTypes.DEFAULT
     await query.answer(f"✅ Язык: {lang_name}")
     
     text = f"🛡️ **{SERVICE_NAME} VPN**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     
     text += f"✅ **Язык выбран:** {lang_name}\n\n"
     text += "💱 **Выберите валюту**\n"
     text += "Для отображения цен в тарифах.\n\n"
     text += "💡 Вы сможете изменить её позже в настройках."
     
-    keyboard = [
-        [
-            InlineKeyboardButton("₴ UAH", callback_data="reg_currency_uah"),
-            InlineKeyboardButton("₽ RUB", callback_data="reg_currency_rub")
-        ],
-        [
-            InlineKeyboardButton("$ USD", callback_data="reg_currency_usd")
-        ]
-    ]
+    # Получаем активные валюты из настроек
+    system_settings = api.get_system_settings()
+    active_currencies = system_settings.get("active_currencies", ["uah", "rub", "usd"])
+    
+    # Генерируем кнопки валют динамически на основе активных валют
+    currency_names = {"uah": "₴ UAH", "rub": "₽ RUB", "usd": "$ USD"}
+    
+    keyboard = []
+    row = []
+    for curr in ["uah", "rub", "usd"]:
+        if curr in active_currencies:
+            row.append(InlineKeyboardButton(
+                currency_names.get(curr, curr.upper()),
+                callback_data=f"reg_currency_{curr}"
+            ))
+            if len(row) == 2:  # По 2 кнопки в ряду
+                keyboard.append(row)
+                row = []
+    
+    if row:  # Добавляем оставшиеся кнопки
+        keyboard.append(row)
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Используем безопасную функцию для редактирования/отправки
@@ -3871,6 +4299,14 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     if not query:
         return
     
+    # Проверяем, что валюта активна
+    system_settings = api.get_system_settings()
+    active_currencies = system_settings.get("active_currencies", ["uah", "rub", "usd"])
+    
+    if currency not in active_currencies:
+        await query.answer("❌ Эта валюта недоступна", show_alert=True)
+        return
+    
     user = update.effective_user
     telegram_id = user.id
     telegram_username = user.username or ""
@@ -3891,7 +4327,7 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     lang_name = lang_names.get(lang, "Русский")
     
     text = f"🛡️ **{SERVICE_NAME} VPN**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     
     text += "✅ **Настройки**\n"
     text += f"🌐 {lang_name}\n"
@@ -3945,7 +4381,7 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     
     # Формируем красивое сообщение об успешной регистрации
     text = "✨ **Регистрация завершена!**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     
     text += "✅ **Аккаунт создан!**\n"
     text += "Ваш аккаунт успешно создан и готов к использованию!\n\n"
@@ -4027,7 +4463,7 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
            "успешно" in message_text or \
            result.get("success", False):
             text = f"✅ **{get_text('trial_activated_title', user_lang)}**\n"
-            text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+            text += "━━━━━━━━━━━━━━━\n\n"
             text += f"{get_text('trial_days_received', user_lang)}\n"
             text += f"{get_text('enjoy_vpn', user_lang)}"
             
@@ -4052,7 +4488,7 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif result and result.get("success", False):
         # Если есть поле success = True
         text = f"✅ **{get_text('trial_activated_title', user_lang)}**\n"
-        text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        text += "━━━━━━━━━━━━━━━\n\n"
         text += f"{get_text('trial_days_received', user_lang)}\n"
         text += f"{get_text('enjoy_vpn', user_lang)}"
         
@@ -4128,11 +4564,74 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
     balance_currency_config = currency_map.get(preferred_currency, currency_map["uah"])
     balance_symbol = balance_currency_config["symbol"]
     
+    # Определяем tier тарифа
+    tariff_tier = tariff.get("tier")
+    if not tariff_tier:
+        duration = tariff.get("duration_days", 0)
+        if duration >= 180:
+            tariff_tier = "elite"
+        elif duration >= 90:
+            tariff_tier = "pro"
+        else:
+            tariff_tier = "basic"
+    
+    # Получаем функции тарифа
+    tariff_features = api.get_tariff_features()
+    features_list = tariff_features.get(tariff_tier, [])
+    
+    # Получаем названия функций из брендинга
+    branding = api.get_branding()
+    features_names = branding.get("tariff_features_names", {})
+    
     text = f"💎 **{get_text('tariff_selected', user_lang)}:** {tariff.get('name', get_text('unknown', user_lang))}\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     text += f"💰 **{get_text('price_label', user_lang)}:** {price:.0f} {currency_config['symbol']}\n"
     text += f"📅 **{get_text('duration_label', user_lang)}:** {tariff.get('duration_days', 0)} {get_text('days', user_lang)}\n"
-    text += f"💳 **Баланс:** {balance:.2f} {balance_symbol}\n\n"
+    
+    # Добавляем информацию о трафике, если есть
+    traffic_limit_gb = tariff.get("traffic_limit_gb")
+    if traffic_limit_gb:
+        if traffic_limit_gb == -1 or traffic_limit_gb >= 10000:
+            text += f"📊 **Трафик:** Безлимитный\n"
+        else:
+            text += f"📊 **Трафик:** {traffic_limit_gb:.0f} GB\n"
+    
+    # Добавляем информацию об устройствах, если есть
+    hwid_limit = tariff.get("hwid_device_limit")
+    if hwid_limit:
+        if hwid_limit == -1 or hwid_limit >= 100:
+            text += f"📱 **Устройства:** Безлимит\n"
+        else:
+            text += f"📱 **Устройства:** {hwid_limit} шт.\n"
+    
+    # Добавляем функции тарифа
+    if features_list:
+        text += "\n✨ **Функции тарифа:**\n"
+        for feature in features_list:
+            if isinstance(feature, dict):
+                feature_key = feature.get("key") or feature.get("name")
+                feature_name = feature.get("name") or feature.get("title")
+                # Пробуем получить название из брендинга
+                if feature_key and features_names and isinstance(features_names, dict):
+                    branded_name = features_names.get(feature_key)
+                    if branded_name:
+                        feature_name = branded_name
+                if not feature_name:
+                    feature_name = feature_key or "Функция"
+                
+                # Добавляем иконку и описание
+                icon = feature.get("icon", "✓")
+                description = feature.get("description") or feature.get("value")
+                
+                if description:
+                    text += f"{icon} **{feature_name}** - {description}\n"
+                else:
+                    text += f"{icon} {feature_name}\n"
+            elif isinstance(feature, str):
+                # Если функция - просто строка
+                text += f"✓ {feature}\n"
+    
+    text += f"\n💳 **Баланс:** {balance:.2f} {balance_symbol}\n\n"
     text += f"**{get_text('payment_methods', user_lang)}**:"
     
     # Получаем доступные способы оплаты из API
@@ -4246,7 +4745,7 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
             
             if response.status_code == 200:
                 text = f"✅ **Тариф активирован!**\n"
-                text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                text += "━━━━━━━━━━━━━━━\n\n"
                 text += f"💎 Тариф успешно активирован с баланса!\n"
                 text += f"💰 Остаток баланса: {result.get('balance', 0):.2f}\n\n"
                 text += f"🎉 Подписка продлена!"
@@ -4293,11 +4792,10 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
     
     if result.get("payment_url"):
         payment_url = result["payment_url"]
-        text = f"💳 **{get_text('payment_created_title', user_lang)}**\n"
-        text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-        text += f"{get_text('go_to_payment_text', user_lang)}:\n\n"
-        text += f"`{payment_url}`\n\n"
-        text += f"{get_text('after_payment', user_lang)}"
+        
+        # Показываем краткое сообщение с кнопкой оплаты
+        # Сообщение будет автоматически заменено после успешной оплаты
+        text = f"💳 {get_text('creating_payment', user_lang)}..."
         
         keyboard = [
             [InlineKeyboardButton(f"💳 {get_text('go_to_payment_button', user_lang)}", url=payment_url)],
@@ -4307,7 +4805,31 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         
         temp_update = Update(update_id=0, callback_query=query)
         try:
-            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+            sent_message = await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+            
+            # Сохраняем message_id в базе данных для последующего удаления после успешной оплаты
+            if sent_message and hasattr(sent_message, 'message_id'):
+                message_id = sent_message.message_id
+            elif query.message:
+                message_id = query.message.message_id
+            else:
+                message_id = None
+            
+            # Сохраняем message_id в payment, если можем получить order_id из результата
+            if message_id and result.get("order_id"):
+                try:
+                    from modules.models.payment import Payment
+                    from modules.core import get_db
+                    db = get_db()
+                    payment = Payment.query.filter_by(order_id=result["order_id"]).first()
+                    if payment:
+                        # Сохраняем message_id в базу данных
+                        payment.telegram_message_id = message_id
+                        db.session.commit()
+                        logger.debug(f"Saved telegram_message_id={message_id} for payment order_id={result['order_id']}")
+                except Exception as e:
+                    logger.debug(f"Could not save message_id: {e}")
+                    
         except Exception as e:
             logger.warning(f"Error in handle_payment, sending without formatting: {e}")
             text_clean = clean_markdown_for_cards(text)
@@ -4354,7 +4876,7 @@ async def show_topup_balance(update: Update, context: ContextTypes.DEFAULT_TYPE)
     currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
     
     text = f"💰 **{get_text('top_up_balance', user_lang)}**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     text += f"💳 **{get_text('balance', user_lang)}:** {balance:.2f} {currency_symbol}\n\n"
     text += f"📝 {get_text('enter_amount', user_lang)}:\n\n"
     text += f"💡 {get_text('select_amount_hint', user_lang)}"
@@ -4422,7 +4944,7 @@ async def select_topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE
     currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
     
     text = f"💰 **{get_text('top_up_balance', user_lang)}**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
     text += f"💵 **{get_text('amount', user_lang)}:** {amount:.0f} {currency_symbol}\n\n"
     text += f"**{get_text('select_topup_method', user_lang)}**:"
     
@@ -4534,7 +5056,7 @@ async def handle_topup_payment(update: Update, context: ContextTypes.DEFAULT_TYP
         if response.status_code == 200 and result.get("payment_url"):
             payment_url = result["payment_url"]
             text = f"💳 **{get_text('balance_topup_created', user_lang)}**\n"
-            text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+            text += "━━━━━━━━━━━━━━━\n\n"
             text += f"💵 **{get_text('amount', user_lang)}:** {amount:.0f} {currency_symbol}\n\n"
             text += f"{get_text('go_to_payment_text', user_lang)}:\n\n"
             text += f"`{payment_url}`\n\n"
@@ -4641,6 +5163,10 @@ def main():
                 if token:
                     result = api.create_support_ticket(token, subject, message)
                     
+                    # Получаем язык пользователя для кнопки
+                    user_data_api = api.get_user_data(token) if token else None
+                    user_lang = get_user_lang(user_data_api, context, token)
+                    
                     # API возвращает {"message": "Created", "ticket_id": nt.id} со статусом 201
                     # Проверяем оба варианта
                     ticket_id = result.get("ticket_id") if result else None
@@ -4649,6 +5175,10 @@ def main():
                         ticket_id = result.get("id")
                     
                     if ticket_id:
+                        # Создаем кнопку "Вернуться в меню"
+                        keyboard = [[InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        
                         await reply_with_logo(
                             update,
                             f"✅ **Тикет создан!**\n\n"
@@ -4656,6 +5186,7 @@ def main():
                             f"Тема: {subject}\n\n"
                             f"Мы ответим вам в ближайшее время.\n\n"
                             f"Вы можете просмотреть тикет в разделе поддержки.",
+                            reply_markup=reply_markup,
                             parse_mode="Markdown"
                         )
                     else:
@@ -4684,14 +5215,26 @@ def main():
                 token = get_user_token(telegram_id)
                 
                 if token and ticket_id:
+                    # Получаем язык пользователя для кнопок
+                    user_data_api = api.get_user_data(token)
+                    user_lang = get_user_lang(user_data_api, context, token)
+                    
                     result = api.reply_to_ticket(token, ticket_id, message)
                     
                     if result.get("id") or result.get("success"):
+                        # Создаем клавиатуру с кнопками "Просмотреть тикет" и "Назад"
+                        keyboard = [
+                            [InlineKeyboardButton(f"💬 {get_text('ticket_view_title', user_lang)} #{ticket_id}", callback_data=f"view_ticket_{ticket_id}")],
+                            [InlineKeyboardButton(f"🔙 {get_text('back_to_support', user_lang)}", callback_data="support")]
+                        ]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        
                         await reply_with_logo(
                             update,
                             f"✅ **Ответ отправлен!**\n\n"
                             f"Тикет #{ticket_id}\n\n"
                             f"Ваш ответ был добавлен в тикет.",
+                            reply_markup=reply_markup,
                             parse_mode="Markdown"
                         )
                     else:
@@ -4842,6 +5385,38 @@ def main():
     
     # Запускаем бота
     logger.info("Бот запущен и готов к работе!")
+    # Удаляем webhook перед запуском polling (если он установлен)
+    try:
+        logger.info("Checking for active webhook...")
+        # Используем прямой HTTP запрос для удаления webhook
+        bot_token = CLIENT_BOT_TOKEN
+        webhook_info_url = f"https://api.telegram.org/bot{bot_token}/getWebhookInfo"
+        delete_webhook_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+        
+        # Проверяем наличие webhook
+        webhook_response = requests.get(webhook_info_url, timeout=5)
+        if webhook_response.status_code == 200:
+            webhook_data = webhook_response.json()
+            if webhook_data.get('ok') and webhook_data.get('result', {}).get('url'):
+                webhook_url = webhook_data['result']['url']
+                logger.info(f"Found active webhook: {webhook_url}. Deleting it...")
+                # Удаляем webhook
+                delete_response = requests.post(
+                    delete_webhook_url,
+                    json={"drop_pending_updates": True},
+                    timeout=5
+                )
+                if delete_response.status_code == 200 and delete_response.json().get('ok'):
+                    logger.info("Webhook deleted successfully")
+                else:
+                    logger.warning(f"Failed to delete webhook: {delete_response.text}")
+            else:
+                logger.info("No active webhook found")
+        else:
+            logger.warning(f"Failed to check webhook status: {webhook_response.text}")
+    except Exception as e:
+        logger.warning(f"Error checking/deleting webhook: {e}. Continuing with polling...")
+    
     # Очищаем предыдущие обновления перед запуском polling
     try:
         logger.info("Starting bot with polling...")

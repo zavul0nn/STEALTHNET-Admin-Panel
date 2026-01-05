@@ -1,6 +1,46 @@
-
-
 services:
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: stealthnet-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-stealthnet}
+      POSTGRES_USER: ${DB_USER:-stealthnet}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-stealthnet_password_change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - stealthnet-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-stealthnet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis для кэширования
+  redis:
+    image: redis:7-alpine
+    container_name: stealthnet-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - stealthnet-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   # Flask API сервер
   api:
     build:
@@ -19,9 +59,22 @@ services:
     working_dir: /app
     environment:
       - FLASK_ENV=production
-      - SQLALCHEMY_DATABASE_URI=sqlite:////app/instance/stealthnet.db
+      - DB_TYPE=postgresql
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-stealthnet}
+      - DB_USER=${DB_USER:-stealthnet}
+      - DB_PASSWORD=${DB_PASSWORD:-stealthnet_password_change_me}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CACHE_TYPE=redis
     networks:
       - stealthnet-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/public/health"]
       interval: 30s
@@ -40,8 +93,19 @@ services:
       - ./.env:/app/.env
       - ./logo.png:/app/logo.png
       - ./logs:/app/logs
+    environment:
+      - FLASK_API_URL=http://api:5000
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     depends_on:
-      - api
+      api:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - stealthnet-network
 
@@ -62,9 +126,13 @@ services:
     networks:
       - stealthnet-network
 
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
 networks:
   stealthnet-network:
     driver: bridge
-
-
 
